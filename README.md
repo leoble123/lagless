@@ -36,7 +36,7 @@ That's all the setup. The PC finds the Mac by itself and starts streaming as soo
 
 Every 6 hours the app checks this repo's latest GitHub Release. If there's a newer one, it downloads it in the background and verifies its SHA-256 checksum against the one published with the release. Then an **Update to x.y.z** button appears. Click it to restart into the new version, or just quit: the update installs on exit, so the next launch is the new version. You can turn this off in settings, and `lagless update` does it from a terminal.
 
-**Shipping a new version:** bump `version` in `Cargo.toml`, commit, then `git tag v0.2.0 && git push --tags`. GitHub Actions builds the `.dmg` and `.exe`, publishes the release, and every installed copy picks it up.
+**Shipping a new version:** bump `version` in `Cargo.toml` and push to `main`. GitHub Actions builds the `.dmg` and `.exe`, publishes release `v<version>`, and every installed copy picks it up.
 
 ## About "zero latency"
 

@@ -1,6 +1,7 @@
 name: build
-# Every push: test + build. Pushing a tag like v0.2.0: also publish a GitHub Release, which is
-# what installed copies auto-update from.
+# Every push: test + build. When main carries a Cargo.toml version that has no release yet, CI
+# publishes GitHub Release v<version> — which is what installed copies auto-update from.
+# So shipping = bump `version` in Cargo.toml and push to main.
 on:
   push:
     branches: ["**"]
@@ -43,20 +44,34 @@ jobs:
           path: dist/lagless-windows-x64.exe*
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     needs: [macos, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Tag must match Cargo.toml version
+        with: { fetch-depth: 0 }
+      - name: Version not released yet?
+        id: ver
         run: |
           v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "Cargo.toml is $v but tag is ${GITHUB_REF_NAME}"; exit 1; }
+          echo "tag=v$v" >> "$GITHUB_OUTPUT"
+          if gh release view "v$v" >/dev/null 2>&1; then
+            echo "v$v is already released; nothing to do"; echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
       - uses: actions/download-artifact@v4
+        if: steps.ver.outputs.new == 'true'
         with: { path: dist, merge-multiple: true }
       - uses: softprops/action-gh-release@v2
+        if: steps.ver.outputs.new == 'true'
         with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: lagless ${{ steps.ver.outputs.tag }}
           files: dist/*
           generate_release_notes: true
