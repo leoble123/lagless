@@ -77,7 +77,7 @@ lagless update
 
 ## Building from source
 
-Needs [Rust](https://rustup.rs) and CMake (used to build the bundled Opus library).
+Needs [Rust](https://rustup.rs) and CMake (used to build the bundled Opus library). With CMake 4+, set `CMAKE_POLICY_VERSION_MINIMUM=3.5` (the macOS script does this for you).
 - **macOS:** `brew install cmake && ./packaging/macos/package.sh` builds `dist/Lagless.app`, `Lagless.dmg` and the update zip.
 - **Windows:** `cargo build --release` builds `target\release\lagless.exe`.
 

@@ -4,6 +4,8 @@
 # Set LAGLESS_UPDATE_REPO=owner/repo to enable auto-update from that repo's GitHub Releases.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
+export CMAKE_POLICY_VERSION_MINIMUM="${CMAKE_POLICY_VERSION_MINIMUM:-3.5}"
 VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 OUT=dist
 rm -rf "$OUT/Lagless.app" && mkdir -p "$OUT"

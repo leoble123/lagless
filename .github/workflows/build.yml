@@ -10,12 +10,16 @@ on:
 
 env:
   LAGLESS_UPDATE_REPO: ${{ github.repository }}
+  # The bundled Opus sources declare an old cmake_minimum_required that CMake 4 rejects.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  # Run on macOS 11+ (matches Info.plist), not just the runner's own OS version.
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
 
 jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: cargo test --release
       - run: ./packaging/macos/package.sh
       - uses: actions/upload-artifact@v4
@@ -30,7 +34,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: cargo test --release
       - run: cargo build --release
       - shell: bash
@@ -50,7 +54,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with: { fetch-depth: 0 }
       - name: Version not released yet?
         id: ver
