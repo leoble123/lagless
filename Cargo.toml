@@ -1,0 +1,33 @@
+[package]
+name = "lagless"
+version = "0.1.0"
+edition = "2021"
+description = "Ultra-low-latency PC-to-Mac audio streaming over Wi-Fi, Ethernet, USB or Bluetooth"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+cpal = "0.15"
+rtrb = "0.3"
+socket2 = "0.5"
+if-addrs = "0.13"
+opus = { version = "0.3", optional = true }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "accesskit", "x11"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+self-replace = "1.5.0"
+
+[features]
+default = ["opus"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[build-dependencies]
+winresource = "0.1.34"
