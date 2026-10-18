@@ -267,6 +267,10 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
             frame.extend_from_slice(b);
             chunk.commit_all();
             downmix(&frame, cap.channels, &mut wire);
+            let g = sh.volume.get();
+            if g < 0.9999 {
+                wire.iter_mut().for_each(|s| *s *= g);
+            }
             sh.meter(&wire, wire_ch);
 
             let mut flags = 0;

@@ -178,7 +178,7 @@ fn open_session(o: &Options, h: AudioHeader, sender: SocketAddr, sh: &Arc<Shared
     for bs in attempts {
         let stats = Arc::new(Stats::default());
         let (prod, cons) = RingBuffer::new(h.sample_rate as usize * ch * 2);
-        let mut playout = Playout::new(cons, ch, out_ch as usize, h.sample_rate, out_rate, o.min_latency_ms, o.max_latency_ms, stats.clone());
+        let mut playout = Playout::new(cons, ch, out_ch as usize, h.sample_rate, out_rate, o.min_latency_ms, o.max_latency_ms, stats.clone(), sh.volume.clone());
         let st = stats.clone();
         let sc = cpal::StreamConfig { channels: out_ch, sample_rate: cpal::SampleRate(out_rate), buffer_size: bs };
         let built = audio::build_output(&device, &sc, fmt, move |out, lat| {
@@ -208,7 +208,7 @@ fn null_session(o: &Options, h: AudioHeader, sender: SocketAddr, sh: &Arc<Shared
     let ch = h.channels as usize;
     let stats = Arc::new(Stats::default());
     let (prod, cons) = RingBuffer::new(h.sample_rate as usize * ch * 2);
-    let mut playout = Playout::new(cons, ch, 2, h.sample_rate, h.sample_rate, o.min_latency_ms, o.max_latency_ms, stats.clone());
+    let mut playout = Playout::new(cons, ch, 2, h.sample_rate, h.sample_rate, o.min_latency_ms, o.max_latency_ms, stats.clone(), sh.volume.clone());
     let alive = Arc::new(());
     let token = Arc::downgrade(&alive);
     let (rate, period) = (h.sample_rate as f64, o.buffer_frames.max(64) as usize);

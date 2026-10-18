@@ -127,6 +127,8 @@ pub struct Shared {
     /// Peak levels since the UI last looked (max-accumulated by the engine, taken by the UI).
     levels: Mutex<[f32; 2]>,
     events: Mutex<VecDeque<String>>,
+    /// Output (receiver) or stream (sender) volume, live from the UI.
+    pub volume: Arc<crate::playout::Volume>,
 }
 
 impl Shared {

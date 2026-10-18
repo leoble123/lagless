@@ -28,6 +28,31 @@ pub struct Stats {
     pub playing: AtomicBool,
 }
 
+/// Linear gain shared with the UI thread, stored as f32 bits so the slider applies instantly.
+pub struct Volume(AtomicU32);
+
+impl Default for Volume {
+    fn default() -> Self {
+        Volume(AtomicU32::new(1.0f32.to_bits()))
+    }
+}
+
+impl Volume {
+    pub fn get(&self) -> f32 {
+        f32::from_bits(self.0.load(Relaxed))
+    }
+
+    pub fn set(&self, gain: f32) {
+        self.0.store(gain.clamp(0.0, 1.0).to_bits(), Relaxed);
+    }
+
+    /// Slider position (0..1) -> gain: silent at 0, then -60 dB .. 0 dB evenly in decibels,
+    /// so every bit of travel sounds like the same step (unlike a linear fader).
+    pub fn slider_to_gain(pos: f32) -> f32 {
+        if pos <= 0.001 { 0.0 } else { 10f32.powf((pos.min(1.0) - 1.0) * 3.0) }
+    }
+}
+
 const TAPS: usize = 32;
 const PHASES: usize = 512;
 
@@ -111,6 +136,10 @@ pub struct Playout {
     integ: f64,
     calm_secs: f64,
     stats: Arc<Stats>,
+    volume: Arc<Volume>,
+    /// Smoothed copy of `volume`, so slider moves don't click.
+    vol: f32,
+    vol_step: f32,
 }
 
 impl Playout {
@@ -124,6 +153,7 @@ impl Playout {
         min_ms: f64,
         max_ms: f64,
         stats: Arc<Stats>,
+        volume: Arc<Volume>,
     ) -> Self {
         let src = src_rate as f64;
         let base_step = src / dst_rate as f64;
@@ -143,6 +173,9 @@ impl Playout {
             underrun_pending: false,
             gain: 0.0,
             gain_step: 1.0 / (0.002 * dst_rate as f64) as f32,
+            vol: volume.get(),
+            vol_step: 1.0 / (0.01 * dst_rate as f32),
+            volume,
             tail: [0.0; 2],
             target: min_ms * src / 1000.0,
             user_min: min_ms * src / 1000.0,
@@ -209,6 +242,7 @@ impl Playout {
         let adj = (0.5 * err + 0.05 * self.integ).clamp(-0.005, 0.005);
         let step = self.base_step * (1.0 + adj);
 
+        let vol_target = self.volume.get();
         for i in 0..frames {
             while self.frac >= 1.0 {
                 if !self.pull() {
@@ -220,11 +254,13 @@ impl Playout {
             let mut y = [0.0f32; 2];
             for (c, yc) in y.iter_mut().enumerate().take(self.ch) {
                 let h = &self.hist[c][self.hpos..self.hpos + TAPS];
-                *yc = self.sinc.interp(h, self.frac) * self.gain;
+                *yc = self.sinc.interp(h, self.frac) * self.gain * self.vol;
             }
             if self.gain < 1.0 {
                 self.gain = (self.gain + self.gain_step).min(1.0);
             }
+            // ~10 ms glide toward the slider value.
+            self.vol += (vol_target - self.vol).clamp(-self.vol_step, self.vol_step);
             self.tail = y;
             let base = i * self.out_ch;
             write_frame(&mut out[base..base + self.out_ch], &y, self.ch);
@@ -319,7 +355,7 @@ mod tests {
     fn drift(ppm: f64) -> (f64, u32, u32) {
         let st = stats(1000, 10_000);
         let (mut prod, cons) = RingBuffer::new(48000 * 2);
-        let mut p = Playout::new(cons, 2, 2, 48000, 48000, 2.0, 150.0, st.clone());
+        let mut p = Playout::new(cons, 2, 2, 48000, 48000, 2.0, 150.0, st.clone(), Arc::new(Volume::default()));
         let mut out = vec![0f32; 64 * 2];
         let src_per_cb = 64.0 * (1.0 + ppm / 1e6);
         let mut owed = 0.0;
@@ -352,6 +388,36 @@ mod tests {
     }
 
     #[test]
+    fn volume_scales_and_glides() {
+        let st = stats(1000, 0);
+        let vol = Arc::new(Volume::default());
+        let (mut prod, cons) = RingBuffer::new(48000);
+        let mut p = Playout::new(cons, 1, 1, 48000, 48000, 2.0, 150.0, st, vol.clone());
+        let mut out = vec![0f32; 1024];
+        // Feed in real time: prefill a buffer's worth, then one callback's worth per callback.
+        let run = |prod: &mut rtrb::Producer<f32>, p: &mut Playout, out: &mut Vec<f32>, n: usize| {
+            for _ in 0..n {
+                for _ in 0..1024 {
+                    let _ = prod.push(0.5);
+                }
+                p.process(out);
+            }
+        };
+        for _ in 0..1500 {
+            let _ = prod.push(0.5);
+        }
+        run(&mut prod, &mut p, &mut out, 4);
+        assert!((out[1023] - 0.5).abs() < 0.01, "{}", out[1023]);
+        vol.set(Volume::slider_to_gain(0.5)); // -30 dB
+        run(&mut prod, &mut p, &mut out, 1);
+        assert!(out[0] > out[1023], "should glide, not jump");
+        run(&mut prod, &mut p, &mut out, 2);
+        assert!((out[1023] / 0.5 - 0.0316).abs() < 0.002, "{}", out[1023]);
+        assert_eq!(Volume::slider_to_gain(0.0), 0.0);
+        assert!((Volume::slider_to_gain(1.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn sinc_is_transparent() {
         let s = Sinc::new(0.94);
         // Passband: a 20 kHz tone at 48k, interpolated at an awkward fractional position.
@@ -371,7 +437,7 @@ mod tests {
     fn underrun_grows_target_but_pause_does_not() {
         let st = stats(1000, 1000);
         let (mut prod, cons) = RingBuffer::new(48000);
-        let mut p = Playout::new(cons, 1, 2, 48000, 48000, 2.0, 150.0, st.clone());
+        let mut p = Playout::new(cons, 1, 2, 48000, 48000, 2.0, 150.0, st.clone(), Arc::new(Volume::default()));
         let mut out = vec![0f32; 64 * 2];
         let feed = |prod: &mut rtrb::Producer<f32>, n| (0..n).for_each(|_| { let _ = prod.push(0.1); });
 

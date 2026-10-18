@@ -26,11 +26,13 @@ That's all the setup. The PC finds the Mac by itself and starts streaming as soo
 
 ## The app
 
-- The **orb** shows live end-to-end latency. It's green under 25 ms, amber under 45 ms and red above that, and it pulses with the music.
-- The **L/R meters** show what's being sent (on the PC) or received (on the Mac).
-- **Chips** show the link (Cable / Wi-Fi / Bluetooth…), the format (e.g. *24-bit · 96 kHz*), *Lossless*, and the round trip.
-- The **graph** shows latency over the last minute, and **Dropouts** counts packets repaired, lost and rebuffered.
-- The **sliders icon** opens settings: output device (DACs and IEM amps), latency floor, device buffer, capture source, quality and loss protection.
+The window is kept deliberately quiet: nothing moves while you're streaming.
+
+- **The big number** is the live end-to-end latency, refreshed once a second. Under it is one status line, and the dot is green under 25 ms, amber under 45 ms and red above.
+- **Volume:** a digital volume control that goes far below your speakers' lowest click. It fades smoothly from full down to about -60 dB and then silent. Click the speaker icon to mute. On the Mac it sets playback volume; on the PC it sets the level of the stream you send. It's remembered between launches.
+- **Mic:** one switch to send the Mac's mic to the PC (see below).
+- **Details** (collapsed by default): the link, format, round trip, buffer and dropout counts.
+- **Settings** (sliders icon): output device (DACs and IEM amps), latency floor, device buffer, capture source, quality and loss protection.
 
 ## Use the Mac's mic on the PC
 

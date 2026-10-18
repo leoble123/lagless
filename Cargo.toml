@@ -1,6 +1,6 @@
 [package]
 name = "lagless"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Ultra-low-latency PC-to-Mac audio streaming over Wi-Fi, Ethernet, USB or Bluetooth"
 

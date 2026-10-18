@@ -1,47 +1,29 @@
 //! Desktop app: one window for both ends. Lightweight immediate-mode UI (egui), no web engine.
+//! Deliberately quiet: nothing animates while streaming, so it never pulls focus.
 
-use crate::engine::{LinkKind, Phase, Shared, Status};
+use crate::engine::{Phase, Shared, Status};
+use crate::playout::Volume;
 use crate::sender::{CodecChoice, Source};
 use crate::update::{self, Updater};
 use crate::{receiver, sender};
 use cpal::traits::{DeviceTrait, HostTrait};
-use eframe::egui::{
-    self, epaint::Mesh, pos2, vec2, Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Rect, RichText, Sense, Shape,
-    Stroke, StrokeKind, Ui,
-};
+use eframe::egui::{self, pos2, vec2, Align, Color32, CornerRadius, FontId, Layout, RichText, Sense, Stroke, Ui};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
-use std::f32::consts::TAU;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // ------------------------------------------------------------------ palette
 
-const BG: Color32 = Color32::from_rgb(11, 12, 16);
-const CARD: Color32 = Color32::from_rgb(20, 22, 29);
-const CARD_EDGE: Color32 = Color32::from_rgb(33, 36, 48);
-const TEXT: Color32 = Color32::from_rgb(230, 232, 239);
-const DIM: Color32 = Color32::from_rgb(138, 144, 162);
-const TEAL: Color32 = Color32::from_rgb(46, 230, 201);
-const BLUE: Color32 = Color32::from_rgb(76, 141, 255);
-const VIOLET: Color32 = Color32::from_rgb(155, 92, 255);
-const PINK: Color32 = Color32::from_rgb(255, 79, 163);
-const GOOD: Color32 = Color32::from_rgb(46, 230, 166);
-const OK: Color32 = Color32::from_rgb(255, 193, 77);
-const BAD: Color32 = Color32::from_rgb(255, 92, 108);
-
-fn latency_color(ms: f32) -> Color32 {
-    if ms <= 0.0 {
-        BLUE
-    } else if ms < 25.0 {
-        GOOD
-    } else if ms < 45.0 {
-        OK
-    } else {
-        BAD
-    }
-}
+const BG: Color32 = Color32::from_rgb(15, 16, 19);
+const CARD: Color32 = Color32::from_rgb(23, 24, 28);
+const EDGE: Color32 = Color32::from_rgb(38, 40, 46);
+const TEXT: Color32 = Color32::from_rgb(232, 232, 234);
+const DIM: Color32 = Color32::from_rgb(139, 141, 150);
+const ACCENT: Color32 = Color32::from_rgb(110, 200, 184);
+const GOOD: Color32 = Color32::from_rgb(107, 200, 140);
+const OK: Color32 = Color32::from_rgb(222, 180, 103);
+const BAD: Color32 = Color32::from_rgb(222, 107, 111);
 
 // ------------------------------------------------------------------ settings
 
@@ -82,6 +64,8 @@ pub struct Settings {
     pub mic_receive: bool,
     /// None = auto-detect VB-Audio "CABLE Input".
     pub mic_out: Option<String>,
+    /// Volume slider position, 0..1 (see `Volume::slider_to_gain`).
+    pub volume: f32,
     pub auto_update: bool,
 }
 
@@ -102,6 +86,7 @@ impl Default for Settings {
             mic_device: None,
             mic_receive: true,
             mic_out: None,
+            volume: 1.0,
             auto_update: true,
         }
     }
@@ -145,8 +130,9 @@ struct Engine {
 type Job = Box<dyn FnOnce(Arc<Shared>) -> anyhow::Result<()> + Send>;
 
 impl Engine {
-    fn spawn(name: &str, job: Job, ctx: egui::Context) -> Self {
+    fn spawn(name: &str, job: Job, gain: f32, ctx: egui::Context) -> Self {
         let shared = Shared::new();
+        shared.volume.set(gain); // before the first sample, so a low setting never blasts
         let sh = shared.clone();
         let handle = std::thread::Builder::new()
             .name(name.into())
@@ -162,6 +148,7 @@ impl Engine {
 
     fn start(s: &Settings, ctx: egui::Context) -> Self {
         let s = s.clone();
+        let vol = s.volume;
         let job: Job = match s.mode {
             Mode::Receive => Box::new(move |sh| {
                 receiver::run(
@@ -201,7 +188,7 @@ impl Engine {
                 )
             }),
         };
-        Engine::spawn("engine", job, ctx)
+        Engine::spawn("engine", job, Volume::slider_to_gain(vol), ctx)
     }
 
     /// The reverse link: on the Mac (receive mode) send the mic; on the PC (send mode) play it
@@ -253,7 +240,7 @@ impl Engine {
             }
             _ => return Ok(None),
         };
-        Ok(Some(Engine::spawn("mic", job, ctx)))
+        Ok(Some(Engine::spawn("mic", job, 1.0, ctx)))
     }
 
     fn stop(&mut self) {
@@ -313,16 +300,14 @@ pub struct App {
     mic: Option<Engine>,
     mic_status: Status,
     mic_problem: Option<String>,
-    mic_level: f32,
     devices: Devices,
     updater: Updater,
     show_settings: bool,
-    levels: [f32; 2],
-    peaks: [(f32, f64); 2],
-    history: VecDeque<f32>,
-    last_sample: f64,
+    /// Latency shown in the big number; refreshed once a second so it doesn't flicker.
+    shown_latency: (f32, f64),
+    /// Volume to restore when unmuting via the speaker icon.
+    unmute_to: f32,
     toast: Option<(String, f64)>,
-    started: Instant,
 }
 
 impl App {
@@ -335,30 +320,25 @@ impl App {
             Err(e) => (None, Some(e)),
         };
         App {
-            mic,
-            mic_status: Status::default(),
-            mic_problem,
-            mic_level: 0.0,
             draft: settings.clone(),
             updater: Updater::start(settings.auto_update),
+            unmute_to: if settings.volume > 0.0 { settings.volume } else { 0.5 },
             settings,
             engine,
             status: Status::default(),
+            mic,
+            mic_status: Status::default(),
+            mic_problem,
             devices: Devices::scan(),
             show_settings: false,
-            levels: [0.0; 2],
-            peaks: [(0.0, 0.0); 2],
-            history: VecDeque::new(),
-            last_sample: 0.0,
+            shown_latency: (0.0, -10.0),
             toast: None,
-            started: Instant::now(),
         }
     }
 
     fn restart(&mut self, ctx: &egui::Context) {
         self.settings.save();
         self.engine.stop();
-        self.history.clear();
         self.engine = Engine::start(&self.settings, ctx.clone());
         self.restart_mic(ctx);
     }
@@ -378,46 +358,21 @@ impl App {
 
     fn tick(&mut self, now: f64) {
         self.status = self.engine.shared.snapshot();
+        let _ = self.engine.shared.take_levels();
         if let Some(e) = self.engine.shared.take_events().pop() {
             self.toast = Some((e, now));
         }
-        // Meters: instant attack, smooth release; peak markers hold for a second.
-        let fresh = self.engine.shared.take_levels();
-        for c in 0..2 {
-            let db = to_meter(fresh[c]);
-            self.levels[c] = if db > self.levels[c] { db } else { (self.levels[c] - 0.025).max(db) };
-            if db >= self.peaks[c].0 || now - self.peaks[c].1 > 1.2 {
-                self.peaks[c] = (db, now);
-            }
-        }
         if let Some(m) = &self.mic {
             self.mic_status = m.shared.snapshot();
-            let pk = m.shared.take_levels();
-            let db = to_meter(pk[0].max(pk[1]));
-            self.mic_level = if db > self.mic_level { db } else { (self.mic_level - 0.025).max(db) };
+            let _ = m.shared.take_levels();
             if let Some(e) = m.shared.take_events().pop() {
                 self.toast = Some((format!("Mic: {e}"), now));
             }
-        } else {
-            self.mic_level = 0.0;
         }
-        if now - self.last_sample > 0.25 {
-            self.last_sample = now;
-            let v = if self.status.phase == Phase::Streaming { self.status.latency_ms } else { 0.0 };
-            self.history.push_back(v);
-            if self.history.len() > 240 {
-                self.history.pop_front();
-            }
+        if now - self.shown_latency.1 >= 1.0 {
+            self.shown_latency = (self.status.latency_ms, now);
         }
     }
-}
-
-/// Peak (linear) -> 0..1 on a -60..0 dB scale.
-fn to_meter(peak: f32) -> f32 {
-    if peak <= 1e-6 {
-        return 0.0;
-    }
-    ((20.0 * peak.log10() + 60.0) / 60.0).clamp(0.0, 1.0)
 }
 
 impl eframe::App for App {
@@ -427,35 +382,25 @@ impl eframe::App for App {
         self.tick(now);
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BG).inner_margin(18))
+            .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::symmetric(20, 16)))
             .show(ui, |ui| {
                 self.header(ui, &ctx);
-                ui.add_space(6.0);
-                self.hero(ui, now);
-                ui.add_space(4.0);
-                self.meters(ui);
-                ui.add_space(12.0);
-                self.chips(ui);
-                ui.add_space(12.0);
-                if !self.show_settings {
-                    self.mic_card(ui, &ctx);
-                    ui.add_space(10.0);
-                }
                 if self.show_settings {
-                    egui::ScrollArea::vertical().max_height(ui.available_height() - 44.0).show(ui, |ui| self.settings_card(ui, &ctx));
-                } else {
-                    self.graph(ui);
                     ui.add_space(10.0);
-                    self.details(ui);
+                    egui::ScrollArea::vertical().max_height(ui.available_height() - 36.0).show(ui, |ui| self.settings_card(ui, &ctx));
+                } else {
+                    self.status_block(ui);
+                    self.volume_row(ui);
+                    ui.add_space(14.0);
+                    self.mic_row(ui, &ctx);
+                    ui.add_space(10.0);
+                    egui::ScrollArea::vertical().max_height(ui.available_height() - 36.0).show(ui, |ui| self.details(ui));
                 }
                 self.footer(ui, now, &ctx);
             });
 
-        // Animate smoothly while there's something moving, otherwise idle cheaply.
-        let busy = matches!(self.status.phase, Phase::Streaming | Phase::Searching | Phase::Starting)
-            || self.levels.iter().any(|l| *l > 0.0)
-            || self.mic_level > 0.0;
-        ctx.request_repaint_after(if busy { Duration::from_millis(16) } else { Duration::from_millis(250) });
+        // Nothing animates, so a few frames a second is plenty for live numbers.
+        ctx.request_repaint_after(Duration::from_millis(250));
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -477,9 +422,7 @@ impl eframe::App for App {
 impl App {
     fn header(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
-            let (r, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
-            gradient_circle(ui.painter(), r.center(), 6.0);
-            ui.label(RichText::new("lagless").size(21.0).strong().color(TEXT));
+            ui.label(RichText::new("lagless").size(16.0).color(TEXT));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if settings_icon(ui, self.show_settings).on_hover_text("Settings").clicked() {
                     self.show_settings = !self.show_settings;
@@ -488,7 +431,7 @@ impl App {
                         self.devices = Devices::scan();
                     }
                 }
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 if let Some(m) = segmented(ui, self.settings.mode) {
                     self.settings.mode = m;
                     self.draft.mode = m;
@@ -498,175 +441,134 @@ impl App {
         });
     }
 
-    fn hero(&self, ui: &mut Ui, now: f64) {
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 210.0), Sense::hover());
+    /// Big latency number and one line of status. Static: no glow, no motion.
+    fn status_block(&self, ui: &mut Ui) {
+        let st = &self.status;
+        let sending = self.settings.mode == Mode::Send;
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 150.0), Sense::hover());
         let p = ui.painter_at(rect);
-        let c = rect.center();
-        let st = &self.status;
-        let streaming = st.phase == Phase::Streaming;
-        let col = match st.phase {
-            Phase::Error(_) => BAD,
-            Phase::Streaming => latency_color(st.latency_ms),
-            _ => BLUE,
+        let c = rect.center() - vec2(0.0, 12.0);
+
+        let lat = self.shown_latency.0;
+        let (big, unit) = match st.phase {
+            Phase::Streaming if lat > 0.0 => (format!("{lat:.0}"), "ms"),
+            _ => ("–".to_string(), ""),
         };
-        let level = self.levels[0].max(self.levels[1]);
-        let breathe = (now as f32 * 1.3).sin() * 0.5 + 0.5;
-
-        // Glow: many faint stacked discs (smooth falloff), swelling with the music, kept inside
-        // the hero area so it never gets clipped flat.
-        let reach = rect.height() / 2.0 - 74.0;
-        let swell = if streaming { 0.55 + level * 0.45 } else { 0.5 + breathe * 0.15 };
-        for i in 0..32 {
-            let t = i as f32 / 31.0;
-            let r = 74.0 + reach * t * swell.max(0.35);
-            p.circle_filled(c, r, col.gamma_multiply(0.035 * (1.0 - t).powf(1.6)));
-        }
-        p.circle_filled(c, 74.0, CARD);
-
-        // Ring: full gradient ring when streaming, a sweeping comet while searching.
-        if streaming {
-            gradient_ring(&p, c, 74.0, 4.0, 0.0, TAU, now as f32 * 0.4);
-        } else if !matches!(st.phase, Phase::Error(_)) {
-            let start = now as f32 * 2.6;
-            gradient_ring(&p, c, 74.0, 4.0, start, start + TAU * 0.35, start);
-            p.circle_stroke(c, 74.0, Stroke::new(1.0, CARD_EDGE));
-        } else {
-            p.circle_stroke(c, 74.0, Stroke::new(3.0, BAD));
+        let g = p.layout_no_wrap(big, FontId::proportional(60.0), TEXT);
+        let u = p.layout_no_wrap(unit.into(), FontId::proportional(16.0), DIM);
+        let w = g.size().x + if unit.is_empty() { 0.0 } else { u.size().x + 4.0 };
+        let top = pos2(c.x - w / 2.0, c.y - g.size().y / 2.0);
+        let gs = g.size();
+        p.galley(top, g, TEXT);
+        if !unit.is_empty() {
+            p.galley(pos2(top.x + gs.x + 4.0, top.y + gs.y - u.size().y - 10.0), u, DIM);
         }
 
-        let (big, small, caption) = match &st.phase {
-            Phase::Streaming if st.latency_ms > 0.0 => (format!("{:.0}", st.latency_ms), "ms", "end-to-end".to_string()),
-            Phase::Streaming => ("●".into(), "", "streaming".into()),
-            Phase::Idle => ("◌".into(), "", if self.settings.mode == Mode::Send { "play something" } else { "waiting for audio" }.into()),
-            Phase::Searching | Phase::Starting => ("…".into(), "", if self.settings.mode == Mode::Send { "finding your Mac" } else { "waiting for your PC" }.into()),
-            Phase::Error(_) => ("!".into(), "", "problem".into()),
-        };
-        let big_font = FontId::proportional(if big.len() <= 3 { 54.0 } else { 40.0 });
-        let galley = p.layout_no_wrap(big.clone(), big_font, TEXT);
-        let small_g = p.layout_no_wrap(small.into(), FontId::proportional(17.0), DIM);
-        let total_w = galley.size().x + if small.is_empty() { 0.0 } else { small_g.size().x + 3.0 };
-        let top = pos2(c.x - total_w / 2.0, c.y - galley.size().y / 2.0 - 8.0);
-        p.galley(top, galley.clone(), TEXT);
-        if !small.is_empty() {
-            p.galley(pos2(top.x + galley.size().x + 3.0, top.y + galley.size().y - small_g.size().y - 8.0), small_g, DIM);
-        }
-        p.text(pos2(c.x, c.y + 30.0), Align2::CENTER_CENTER, caption, FontId::proportional(13.0), col.gamma_multiply(0.9));
-    }
-
-    fn meters(&self, ui: &mut Ui) {
-        for (c, label) in ["L", "R"].iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(*label).size(11.0).color(DIM).monospace());
-                let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 7.0), Sense::hover());
-                let p = ui.painter();
-                p.rect_filled(r, CornerRadius::same(4), CARD);
-                let lit = Rect::from_min_size(r.min, vec2(r.width() * self.levels[c], r.height()));
-                if lit.width() > 0.5 {
-                    // Gradient spans the full track so loud = pink, like a real meter.
-                    gradient_rect(p, lit, r.width(), &[TEAL, BLUE, VIOLET, PINK]);
-                }
-                let px = r.min.x + r.width() * self.peaks[c].0;
-                if self.peaks[c].0 > 0.01 {
-                    p.line_segment([pos2(px, r.min.y - 1.0), pos2(px, r.max.y + 1.0)], Stroke::new(2.0, TEXT));
-                }
-            });
-        }
-    }
-
-    fn chips(&self, ui: &mut Ui) {
-        let st = &self.status;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-            let linked = matches!(st.phase, Phase::Streaming | Phase::Idle);
-            if linked {
-                let link_col = match st.link {
-                    LinkKind::Cable | LinkKind::Thunderbolt | LinkKind::Loopback => GOOD,
-                    LinkKind::WiFi | LinkKind::Network => BLUE,
-                    LinkKind::Bluetooth => OK,
+        let peer = if st.peer_name.is_empty() { None } else { Some(st.peer_name.as_str()) };
+        let (dot, line) = match (&st.phase, peer) {
+            (Phase::Streaming, Some(n)) => {
+                let fmt = match st.codec.as_str() {
+                    "pcm24" => format!("24-bit/{} kHz", fmt_khz(st.sample_rate)),
+                    "pcm16" => format!("16-bit/{} kHz", fmt_khz(st.sample_rate)),
+                    _ => "Opus".into(),
                 };
-                chip(ui, st.link.label(), link_col);
-                if st.sample_rate > 0 {
-                    let bits = match st.codec.as_str() {
-                        "pcm24" => "24-bit · ",
-                        "pcm16" => "16-bit · ",
-                        _ => "",
-                    };
-                    chip(ui, &format!("{bits}{} kHz", fmt_khz(st.sample_rate)), TEXT);
-                }
-                if st.lossless {
-                    chip(ui, "Lossless", TEAL);
-                } else {
-                    chip(ui, "Opus 320k", OK);
-                }
-                if st.rtt_ms > 0.0 {
-                    chip(ui, &format!("RTT {:.1} ms", st.rtt_ms), DIM);
-                }
-            } else {
-                chip(ui, if self.settings.mode == Mode::Send { "Sender" } else { "Receiver" }, DIM);
-                chip(ui, "Wi-Fi · Ethernet · USB · Bluetooth", DIM);
+                let col = if lat < 25.0 { GOOD } else if lat < 45.0 { OK } else { BAD };
+                (col, format!("{} {n}  ·  {}  ·  {fmt}", if sending { "To" } else { "From" }, st.link.label()))
             }
+            (Phase::Idle, Some(n)) => (DIM, format!("Connected to {n} — {}", if sending { "play something" } else { "nothing playing" })),
+            (Phase::Error(_), _) => (BAD, "Something went wrong — see below".into()),
+            _ => (DIM, if sending { "Looking for your Mac…" } else { "Waiting for your PC…" }.into()),
+        };
+        let lg = p.layout_no_wrap(line, FontId::proportional(12.5), DIM);
+        let lw = lg.size().x + 12.0;
+        let ly = rect.max.y - 22.0;
+        let lx = c.x - lw / 2.0;
+        p.circle_filled(pos2(lx + 3.0, ly), 3.0, dot);
+        p.galley(pos2(lx + 12.0, ly - lg.size().y / 2.0), lg, DIM);
+    }
+
+    fn volume_row(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            let muted = self.settings.volume <= 0.0;
+            if speaker_icon(ui, muted).on_hover_text(if muted { "Unmute" } else { "Mute" }).clicked() {
+                if muted {
+                    self.settings.volume = self.unmute_to;
+                } else {
+                    self.unmute_to = self.settings.volume;
+                    self.settings.volume = 0.0;
+                }
+                self.apply_volume(true);
+            }
+            let pct = format!("{:.0}%", self.settings.volume * 100.0);
+            ui.spacing_mut().slider_width = ui.available_width() - 44.0;
+            let r = ui.add(egui::Slider::new(&mut self.settings.volume, 0.0..=1.0).show_value(false));
+            if r.changed() {
+                self.apply_volume(r.drag_stopped() || !r.dragged());
+            }
+            if r.drag_stopped() {
+                self.settings.save();
+            }
+            ui.label(RichText::new(pct).size(12.0).color(DIM).monospace());
         });
     }
 
-    fn mic_card(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+    /// Push the slider to the running engine immediately; optionally persist.
+    fn apply_volume(&mut self, save: bool) {
+        self.engine.shared.volume.set(Volume::slider_to_gain(self.settings.volume));
+        self.draft.volume = self.settings.volume;
+        if self.settings.volume > 0.0 {
+            self.unmute_to = self.settings.volume;
+        }
+        if save {
+            self.settings.save();
+        }
+    }
+
+    fn mic_row(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let mode = self.settings.mode;
         let ms = self.mic_status.clone();
         let mut toggled = false;
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                let (on, title) = match mode {
-                    Mode::Receive => (&mut self.settings.mic_send, "Send this Mac's mic to the PC"),
-                    Mode::Send => (&mut self.settings.mic_receive, "Use the Mac's mic on this PC"),
+        let needs_cable = mode == Mode::Send && self.settings.mic_receive && self.mic_problem.as_deref() == Some("no virtual cable");
+        ui.horizontal(|ui| {
+            let (on, title) = match mode {
+                Mode::Receive => (&mut self.settings.mic_send, "Send mic to PC"),
+                Mode::Send => (&mut self.settings.mic_receive, "Use Mac mic"),
+            };
+            if toggle(ui, on).clicked() {
+                toggled = true;
+            }
+            ui.label(RichText::new(title).size(13.0).color(TEXT));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let (text, col, tip) = match (&ms.phase, self.mic.is_some()) {
+                    _ if needs_cable => ("needs VB-Cable".to_string(), OK, ""),
+                    (_, false) => match &self.mic_problem {
+                        Some(p) => ("problem".to_string(), BAD, p.as_str()),
+                        None => (String::new(), DIM, ""),
+                    },
+                    (Phase::Error(e), _) => ("problem".to_string(), BAD, e.as_str()),
+                    (Phase::Streaming, _) if mode == Mode::Send => ("on · CABLE Output".to_string(), DIM, "Choose \"CABLE Output\" as the microphone in Discord, Zoom, OBS…"),
+                    (Phase::Streaming, _) => (format!("on · {:.0} ms", ms.latency_ms), DIM, "Use headphones on the Mac (or your call app's echo cancellation) to avoid echo."),
+                    (Phase::Idle, _) => ("no mic audio".to_string(), DIM, ""),
+                    _ => ("connecting…".to_string(), DIM, ""),
                 };
-                if toggle(ui, on).clicked() {
+                let l = ui.label(RichText::new(text).size(11.5).color(col));
+                if !tip.is_empty() {
+                    l.on_hover_text(tip);
+                }
+            });
+        });
+        if needs_cable {
+            ui.horizontal(|ui| {
+                ui.add_space(44.0);
+                if ui.link(RichText::new("Get VB-Cable (free)").size(11.5)).clicked() {
+                    ctx.open_url(egui::OpenUrl::new_tab(VB_CABLE_URL));
+                }
+                ui.label(RichText::new("·").color(DIM));
+                if ui.link(RichText::new("Retry").size(11.5)).clicked() {
                     toggled = true;
                 }
-                ui.label(RichText::new(title).size(13.0).color(TEXT));
             });
-            let active = self.mic.is_some();
-            let status = match (&ms.phase, active) {
-                (_, false) => match (&self.mic_problem, mode) {
-                    (Some(p), Mode::Send) if p == "no virtual cable" => None,
-                    (Some(p), _) => Some((p.clone(), BAD)),
-                    _ => Some(("Off".into(), DIM)),
-                },
-                (Phase::Error(e), _) => Some((e.clone(), BAD)),
-                (Phase::Streaming, _) => {
-                    let lat = if ms.latency_ms > 0.0 { format!(" · {:.0} ms", ms.latency_ms) } else { String::new() };
-                    let dir = if mode == Mode::Receive { "to" } else { "from" };
-                    Some((format!("{dir} {} via {}{lat}", ms.peer_name, ms.link.label()), GOOD))
-                }
-                (Phase::Idle, _) => Some(("Connected — no mic audio".into(), OK)),
-                _ => Some((if mode == Mode::Receive { "Looking for the PC…" } else { "Waiting for the Mac…" }.into(), BLUE)),
-            };
-            if let Some((text, col)) = status {
-                ui.label(RichText::new(text).size(11.5).color(col));
-            }
-            if active {
-                let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 5.0), Sense::hover());
-                ui.painter().rect_filled(r, CornerRadius::same(3), BG);
-                let lit = Rect::from_min_size(r.min, vec2(r.width() * self.mic_level, r.height()));
-                if lit.width() > 0.5 {
-                    gradient_rect(ui.painter(), lit, r.width(), &[TEAL, BLUE, VIOLET, PINK]);
-                }
-            }
-            match mode {
-                Mode::Send if self.mic_problem.as_deref() == Some("no virtual cable") && self.settings.mic_receive => {
-                    hint(ui, "Windows apps need a virtual mic for this. Install the free VB-Audio Virtual Cable, then click Retry.");
-                    ui.horizontal(|ui| {
-                        if accent_button(ui, "Get VB-Cable").clicked() {
-                            ctx.open_url(egui::OpenUrl::new_tab(VB_CABLE_URL));
-                        }
-                        if ui.button("Retry").clicked() {
-                            toggled = true;
-                        }
-                    });
-                }
-                Mode::Send if active => hint(ui, "In Discord, Zoom, OBS… choose \"CABLE Output\" as your microphone."),
-                Mode::Receive if active => hint(ui, "Tip: use headphones/IEMs on the Mac, or the PC app's echo cancellation, to avoid echo."),
-                _ => {}
-            }
-        });
+        }
         if toggled {
             self.draft.mic_send = self.settings.mic_send;
             self.draft.mic_receive = self.settings.mic_receive;
@@ -674,83 +576,27 @@ impl App {
         }
     }
 
-    fn graph(&self, ui: &mut Ui) {
-        card(ui, |ui| {
-            let vals: Vec<f32> = self.history.iter().copied().collect();
-            let live: Vec<f32> = vals.iter().copied().filter(|v| *v > 0.0).collect();
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("LATENCY · LAST MINUTE").size(10.5).color(DIM));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if let (Some(lo), Some(hi)) = (live.iter().copied().reduce(f32::min), live.iter().copied().reduce(f32::max)) {
-                        ui.label(RichText::new(format!("{lo:.0}–{hi:.0} ms")).size(11.0).color(TEXT));
-                    }
-                });
-            });
-            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 64.0), Sense::hover());
-            let p = ui.painter_at(r);
-            for i in 1..4 {
-                let y = r.min.y + r.height() * i as f32 / 4.0;
-                p.line_segment([pos2(r.min.x, y), pos2(r.max.x, y)], Stroke::new(1.0, CARD_EDGE.gamma_multiply(0.6)));
-            }
-            if live.is_empty() {
-                p.text(r.center(), Align2::CENTER_CENTER, "no audio yet", FontId::proportional(12.0), DIM.gamma_multiply(0.7));
-                return;
-            }
-            let top = live.iter().copied().fold(20.0f32, f32::max) * 1.25;
-            let n = 240usize;
-            let x_of = |i: usize| r.max.x - (vals.len() - 1 - i) as f32 * r.width() / (n - 1) as f32;
-            let y_of = |v: f32| r.max.y - (v / top) * r.height();
-            // Filled area under the line, fading downward.
-            let mut mesh = Mesh::default();
-            let mut line = Vec::new();
-            for (i, &v) in vals.iter().enumerate() {
-                if v <= 0.0 {
-                    if line.len() > 1 {
-                        p.add(Shape::line(std::mem::take(&mut line), Stroke::new(2.0, latency_color(v.max(1.0)))));
-                    }
-                    line.clear();
-                    continue;
-                }
-                let (x, y) = (x_of(i), y_of(v));
-                let col = latency_color(v);
-                let idx = mesh.vertices.len() as u32;
-                mesh.colored_vertex(pos2(x, y), col.gamma_multiply(0.28));
-                mesh.colored_vertex(pos2(x, r.max.y), col.gamma_multiply(0.0));
-                if i > 0 && vals[i - 1] > 0.0 && idx >= 2 {
-                    mesh.add_triangle(idx - 2, idx - 1, idx);
-                    mesh.add_triangle(idx - 1, idx + 1, idx);
-                }
-                line.push(pos2(x, y));
-            }
-            p.add(Shape::mesh(mesh));
-            if line.len() > 1 {
-                let last = *live.last().unwrap();
-                p.add(Shape::line(line.clone(), Stroke::new(2.0, latency_color(last))));
-                p.circle_filled(*line.last().unwrap(), 3.5, latency_color(last));
-            }
-        });
-    }
-
     fn details(&self, ui: &mut Ui) {
         let st = &self.status;
-        card(ui, |ui| {
-            egui::Grid::new("details").num_columns(2).spacing(vec2(14.0, 7.0)).show(ui, |ui| {
+        egui::CollapsingHeader::new(RichText::new("Details").size(12.0).color(DIM)).id_salt("details").default_open(false).show(ui, |ui| {
+            egui::Grid::new("details_grid").num_columns(2).spacing(vec2(14.0, 6.0)).show(ui, |ui| {
                 let row = |ui: &mut Ui, k: &str, v: String| {
                     ui.label(RichText::new(k).size(12.0).color(DIM));
-                    ui.label(RichText::new(v).size(12.5).color(TEXT));
+                    ui.label(RichText::new(v).size(12.0).color(TEXT));
                     ui.end_row();
                 };
-                let peer_label = if self.settings.mode == Mode::Send { "Sending to" } else { "Receiving from" };
-                if st.peer_name.is_empty() {
-                    row(ui, peer_label, "—".into());
-                } else {
-                    let via = if st.link_name.is_empty() { String::new() } else { format!(" · {}", st.link_name) };
-                    row(ui, peer_label, format!("{}  ({}{via})", st.peer_name, st.peer_addr));
+                let dash = |s: &str| if s.is_empty() { "–".to_string() } else { s.to_string() };
+                row(ui, if self.settings.mode == Mode::Send { "Sending to" } else { "From" }, if st.peer_addr.is_empty() { "–".into() } else { format!("{} ({})", st.peer_name, st.peer_addr) });
+                row(ui, "Link", if st.link_name.is_empty() { "–".into() } else { format!("{} · {}", st.link.label(), st.link_name) });
+                row(ui, if self.settings.mode == Mode::Send { "Capturing" } else { "Playing on" }, dash(&st.device_name));
+                if st.sample_rate > 0 && !st.codec.is_empty() {
+                    row(ui, "Format", format!("{} · {} kHz{}", st.codec, fmt_khz(st.sample_rate), if st.lossless { " · lossless" } else { "" }));
                 }
-                let dev_label = if self.settings.mode == Mode::Send { "Capturing" } else { "Playing on" };
-                row(ui, dev_label, if st.device_name.is_empty() { "—".into() } else { st.device_name.clone() });
+                if st.rtt_ms > 0.0 {
+                    row(ui, "Round trip", format!("{:.2} ms", st.rtt_ms));
+                }
                 if st.target_ms > 0.0 {
-                    row(ui, "Buffer", format!("{:.1} ms  (aiming for {:.1})", st.buffer_ms, st.target_ms));
+                    row(ui, "Buffer", format!("{:.1} ms (target {:.1})", st.buffer_ms, st.target_ms));
                 }
                 row(ui, "Dropouts", format!("{} repaired · {} lost · {} rebuffers", st.fixed, st.lost, st.underruns));
             });
@@ -858,7 +704,7 @@ impl App {
     }
 
     fn footer(&mut self, ui: &mut Ui, now: f64, ctx: &egui::Context) {
-        let h = 34.0;
+        let h = 28.0;
         let space = ui.available_height() - h;
         if space > 0.0 {
             ui.add_space(space);
@@ -901,11 +747,10 @@ impl App {
                 _ => {}
             });
         });
-        let _ = self.started;
     }
 }
 
-// ------------------------------------------------------------------ widgets & drawing
+// ------------------------------------------------------------------ widgets
 
 fn style(ctx: &egui::Context) {
     let mut v = egui::Visuals::dark();
@@ -913,9 +758,9 @@ fn style(ctx: &egui::Context) {
     v.window_fill = CARD;
     v.extreme_bg_color = Color32::from_rgb(15, 16, 22);
     v.override_text_color = Some(TEXT);
-    v.selection.bg_fill = VIOLET.gamma_multiply(0.55);
+    v.selection.bg_fill = ACCENT.gamma_multiply(0.75);
     v.selection.stroke = Stroke::new(1.0, TEXT);
-    v.hyperlink_color = TEAL;
+    v.hyperlink_color = ACCENT;
     let r = CornerRadius::same(8);
     for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
         w.corner_radius = r;
@@ -923,7 +768,7 @@ fn style(ctx: &egui::Context) {
     v.widgets.inactive.weak_bg_fill = Color32::from_rgb(28, 31, 41);
     v.widgets.inactive.bg_fill = Color32::from_rgb(28, 31, 41);
     v.widgets.hovered.weak_bg_fill = Color32::from_rgb(38, 42, 56);
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, BLUE.gamma_multiply(0.6));
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, EDGE);
     v.widgets.active.weak_bg_fill = Color32::from_rgb(48, 52, 70);
     v.slider_trailing_fill = true;
     ctx.set_visuals(v);
@@ -935,13 +780,13 @@ fn style(ctx: &egui::Context) {
 
 fn segmented(ui: &mut Ui, mode: Mode) -> Option<Mode> {
     let mut out = None;
-    egui::Frame::new().fill(CARD).corner_radius(CornerRadius::same(10)).inner_margin(3).stroke(Stroke::new(1.0, CARD_EDGE)).show(ui, |ui| {
+    egui::Frame::new().fill(CARD).corner_radius(CornerRadius::same(10)).inner_margin(3).stroke(Stroke::new(1.0, EDGE)).show(ui, |ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         // right_to_left parent: add Receive first so Send renders on the left.
         for (m, label) in [(Mode::Receive, "Receive"), (Mode::Send, "Send")] {
             let on = m == mode;
-            let text = RichText::new(label).size(12.5).color(if on { BG } else { DIM }).strong();
-            let b = egui::Button::new(text).fill(if on { TEAL } else { Color32::TRANSPARENT }).corner_radius(CornerRadius::same(8)).stroke(Stroke::NONE);
+            let text = RichText::new(label).size(12.0).color(if on { TEXT } else { DIM });
+            let b = egui::Button::new(text).fill(if on { EDGE } else { Color32::TRANSPARENT }).corner_radius(CornerRadius::same(7)).stroke(Stroke::NONE);
             if ui.add(b).clicked() && !on {
                 out = Some(m);
             }
@@ -953,7 +798,7 @@ fn segmented(ui: &mut Ui, mode: Mode) -> Option<Mode> {
 /// Three-slider "settings" glyph, painted (no icon font needed).
 fn settings_icon(ui: &mut Ui, on: bool) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
-    let col = if on { TEAL } else if resp.hovered() { TEXT } else { DIM };
+    let col = if on { TEXT } else if resp.hovered() { TEXT } else { DIM };
     let p = ui.painter();
     for (k, knob) in [0.3f32, 0.7, 0.45].iter().enumerate() {
         let y = r.min.y + 7.0 + k as f32 * 6.0;
@@ -967,7 +812,7 @@ fn settings_icon(ui: &mut Ui, on: bool) -> egui::Response {
 fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     egui::Frame::new()
         .fill(CARD)
-        .stroke(Stroke::new(1.0, CARD_EDGE))
+        .stroke(Stroke::new(1.0, EDGE))
         .corner_radius(CornerRadius::same(12))
         .inner_margin(12)
         .show(ui, |ui| {
@@ -975,15 +820,6 @@ fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
             add(ui)
         })
         .inner
-}
-
-fn chip(ui: &mut Ui, text: &str, col: Color32) {
-    egui::Frame::new()
-        .fill(col.gamma_multiply(0.12))
-        .stroke(Stroke::new(1.0, col.gamma_multiply(0.35)))
-        .corner_radius(CornerRadius::same(20))
-        .inner_margin(egui::Margin::symmetric(9, 3))
-        .show(ui, |ui| ui.label(RichText::new(text).size(11.5).color(col)));
 }
 
 fn section(ui: &mut Ui, s: &str) {
@@ -1000,7 +836,7 @@ fn toggle(ui: &mut Ui, on: &mut bool) -> egui::Response {
     }
     let t = ui.ctx().animate_bool_responsive(resp.id, *on);
     let p = ui.painter();
-    let track = if *on { TEAL } else { Color32::from_rgb(44, 48, 62) };
+    let track = if *on { ACCENT } else { EDGE };
     p.rect_filled(r, CornerRadius::same(10), track.gamma_multiply(if *on { 0.9 } else { 1.0 }));
     let x = egui::lerp((r.min.x + 10.0)..=(r.max.x - 10.0), t);
     p.circle_filled(pos2(x, r.center().y), 7.5, if *on { BG } else { DIM });
@@ -1012,78 +848,35 @@ fn hint(ui: &mut Ui, s: &str) {
 }
 
 fn accent_button(ui: &mut Ui, text: &str) -> egui::Response {
-    ui.add(egui::Button::new(RichText::new(text).color(BG).strong()).fill(TEAL).corner_radius(CornerRadius::same(8)))
+    ui.add(egui::Button::new(RichText::new(text).color(BG)).fill(ACCENT).corner_radius(CornerRadius::same(7)))
+}
+
+
+/// Small painted speaker; slashed when muted.
+fn speaker_icon(ui: &mut Ui, muted: bool) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(vec2(22.0, 20.0), Sense::click());
+    let col = if resp.hovered() { TEXT } else { DIM };
+    let p = ui.painter();
+    let c = r.center() - vec2(3.0, 0.0);
+    let body = vec![c + vec2(-5.0, -2.5), c + vec2(-2.0, -2.5), c + vec2(2.5, -6.0), c + vec2(2.5, 6.0), c + vec2(-2.0, 2.5), c + vec2(-5.0, 2.5)];
+    p.add(egui::Shape::convex_polygon(body, col, Stroke::NONE));
+    if muted {
+        p.line_segment([c + vec2(5.0, -3.5), c + vec2(10.0, 3.5)], Stroke::new(1.5, col));
+        p.line_segment([c + vec2(10.0, -3.5), c + vec2(5.0, 3.5)], Stroke::new(1.5, col));
+    } else {
+        for (rad, a) in [(5.5f32, 0.7f32), (9.0, 0.75)] {
+            let pts: Vec<_> = (0..=8).map(|i| {
+                let t = -a + 2.0 * a * i as f32 / 8.0;
+                c + vec2(2.5 + rad * t.cos(), rad * t.sin())
+            }).collect();
+            p.add(egui::Shape::line(pts, Stroke::new(1.4, col)));
+        }
+    }
+    resp
 }
 
 fn fmt_khz(rate: u32) -> String {
     if rate % 1000 == 0 { format!("{}", rate / 1000) } else { format!("{:.1}", rate as f32 / 1000.0) }
-}
-
-fn lerp_color(stops: &[Color32], t: f32) -> Color32 {
-    let t = t.clamp(0.0, 1.0) * (stops.len() - 1) as f32;
-    let i = (t as usize).min(stops.len() - 2);
-    let f = t - i as f32;
-    let (a, b) = (stops[i], stops[i + 1]);
-    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f) as u8;
-    Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
-}
-
-/// Horizontal multi-stop gradient; colour position is relative to `full_width` from rect.min.x.
-fn gradient_rect(p: &egui::Painter, r: Rect, full_width: f32, stops: &[Color32]) {
-    let mut mesh = Mesh::default();
-    let steps = 24;
-    for s in 0..=steps {
-        let x = r.min.x + r.width() * s as f32 / steps as f32;
-        let col = lerp_color(stops, (x - r.min.x) / full_width);
-        mesh.colored_vertex(pos2(x, r.min.y), col);
-        mesh.colored_vertex(pos2(x, r.max.y), col);
-        if s > 0 {
-            let i = (s * 2) as u32;
-            mesh.add_triangle(i - 2, i - 1, i);
-            mesh.add_triangle(i - 1, i + 1, i);
-        }
-    }
-    p.add(Shape::mesh(mesh));
-}
-
-/// Arc from angle a0 to a1 with the brand gradient rotating by `spin`.
-fn gradient_ring(p: &egui::Painter, c: Pos2, r: f32, w: f32, a0: f32, a1: f32, spin: f32) {
-    let stops = [TEAL, BLUE, VIOLET, PINK, TEAL];
-    let n = ((a1 - a0).abs() / TAU * 120.0).max(8.0) as usize;
-    let mut mesh = Mesh::default();
-    let partial = (a1 - a0) < TAU - 0.01;
-    for s in 0..=n {
-        let a = a0 + (a1 - a0) * s as f32 / n as f32;
-        let t = ((a - spin) / TAU).rem_euclid(1.0);
-        let mut col = lerp_color(&stops, t);
-        if partial {
-            col = col.gamma_multiply((s as f32 / n as f32).powf(1.5)); // comet tail
-        }
-        let dir = vec2(a.cos(), a.sin());
-        mesh.colored_vertex(c + dir * (r - w / 2.0), col);
-        mesh.colored_vertex(c + dir * (r + w / 2.0), col);
-        if s > 0 {
-            let i = (s * 2) as u32;
-            mesh.add_triangle(i - 2, i - 1, i);
-            mesh.add_triangle(i - 1, i + 1, i);
-        }
-    }
-    p.add(Shape::mesh(mesh));
-}
-
-fn gradient_circle(p: &egui::Painter, c: Pos2, r: f32) {
-    let mut mesh = Mesh::default();
-    mesh.colored_vertex(c, BLUE);
-    let n = 32;
-    for s in 0..=n {
-        let a = s as f32 / n as f32 * TAU;
-        mesh.colored_vertex(c + vec2(a.cos(), a.sin()) * r, lerp_color(&[TEAL, VIOLET, PINK, TEAL], s as f32 / n as f32));
-        if s > 0 {
-            mesh.add_triangle(0, s as u32, s as u32 + 1);
-        }
-    }
-    p.add(Shape::mesh(mesh));
-    let _ = StrokeKind::Inside;
 }
 
 fn app_icon() -> egui::IconData {
@@ -1099,8 +892,8 @@ pub fn run() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("lagless")
-            .with_inner_size([440.0, 800.0])
-            .with_min_inner_size([380.0, 680.0])
+            .with_inner_size([400.0, 560.0])
+            .with_min_inner_size([360.0, 420.0])
             .with_icon(Arc::new(app_icon())),
         ..Default::default()
     };
