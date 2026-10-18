@@ -32,6 +32,16 @@ That's all the setup. The PC finds the Mac by itself and starts streaming as soo
 - The **graph** shows latency over the last minute, and **Dropouts** counts packets repaired, lost and rebuffered.
 - The **sliders icon** opens settings: output device (DACs and IEM amps), latency floor, device buffer, capture source, quality and loss protection.
 
+## Use the Mac's mic on the PC
+
+lagless can also send your Mac's microphone (for example the iMac's built-in mic) back to the PC at the same time as the PC's audio plays on the Mac, so you can use it in Discord, Zoom, OBS or games.
+
+1. **On the PC:** install the free **[VB-Audio Virtual Cable](https://vb-audio.com/Cable/)** and restart the PC. Windows apps can only use microphones that the system lists, and this gives you one. The app shows a **Get VB-Cable** button if it's missing.
+2. **On the Mac:** turn on **Send this Mac's mic to the PC** and allow microphone access when macOS asks. Pick a different mic in settings if you like.
+3. **In your PC app:** choose **CABLE Output** as the microphone.
+
+The mic travels uncompressed with the same 1 ms frames and loss protection as the speaker stream, on its own port (UDP 47802), so the two directions don't affect each other. Keep **CABLE Input** from being your PC's default speaker; lagless refuses to start the mic link if it is, because the mic would loop back to the Mac. To avoid echo in calls, use headphones or IEMs on the Mac, or leave your call app's echo cancellation on.
+
 ## Auto-update
 
 Every 6 hours the app checks this repo's latest GitHub Release. If there's a newer one, it downloads it in the background and verifies its SHA-256 checksum against the one published with the release. Then an **Update to x.y.z** button appears. Click it to restart into the new version, or just quit: the update installs on exit, so the next launch is the new version. You can turn this off in settings, and `lagless update` does it from a terminal.
@@ -64,7 +74,7 @@ Where the time goes on a cable: Windows' audio engine hands loopback audio over 
 The same binary works headless when given arguments (on a Mac: `/Applications/Lagless.app/Contents/MacOS/lagless`):
 
 ```
-lagless send     [--to 192.168.1.20] [--name studio] [--codec auto|pcm24|pcm16|opus]
+lagless send     [--to 192.168.1.20] [--port 47801|47802] [--name studio] [--codec auto|pcm24|pcm16|opus]
                  [--frame-ms 1.0] [--fec 1] [--bitrate 320] [--source loopback|input|tone] [--device NAME]
 lagless receive  [--device NAME] [--min-latency 2] [--max-latency 120] [--buffer 64] [--name NAME]
 lagless devices

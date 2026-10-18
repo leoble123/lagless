@@ -37,6 +37,8 @@ pub enum Source {
 #[derive(Clone)]
 pub struct Options {
     pub to: Option<String>,
+    /// Receiver port to stream to: AUDIO_PORT for speakers, MIC_PORT for the mic link.
+    pub port: u16,
     pub name: Option<String>,
     pub codec: CodecChoice,
     pub frame_ms: f64,
@@ -130,6 +132,7 @@ impl Path {
 /// Picks the receiver and, among every address it is reachable on, the one with the lowest RTT.
 struct Router {
     fixed: Option<SocketAddr>,
+    port: u16,
     want_name: Option<String>,
     dir: Option<net::Directory>,
     receiver: Option<(u64, String)>,
@@ -146,14 +149,16 @@ impl Router {
         let Some(dir) = &self.dir else { return vec![] };
         let dir = dir.lock().unwrap();
         if self.receiver.is_none() {
+            let port = self.port;
             let mut found: Vec<_> = dir
                 .iter()
+                .filter(|(_, s)| s.addrs.keys().any(|a| a.port() == port))
                 .filter(|(_, s)| self.want_name.as_ref().map_or(true, |w| s.name.to_lowercase().contains(&w.to_lowercase())))
                 .collect();
             found.sort_by_key(|(_, s)| s.first_seen);
             if let Some((id, s)) = found.first() {
-                if dir.len() > 1 && self.want_name.is_none() {
-                    let names: Vec<_> = dir.values().map(|s| s.name.as_str()).collect();
+                if found.len() > 1 && self.want_name.is_none() {
+                    let names: Vec<_> = found.iter().map(|(_, s)| s.name.as_str()).collect();
                     self.sh.event(format!("Several receivers found {names:?}; using \"{}\"", s.name));
                 }
                 self.receiver = Some((**id, s.name.clone()));
@@ -161,7 +166,13 @@ impl Router {
         }
         let Some((id, _)) = &self.receiver else { return vec![] };
         dir.get(id)
-            .map(|s| s.addrs.iter().filter(|(_, t)| t.elapsed() < Duration::from_secs(5)).map(|(a, _)| *a).collect())
+            .map(|s| {
+                s.addrs
+                    .iter()
+                    .filter(|(a, t)| a.port() == self.port && t.elapsed() < Duration::from_secs(5))
+                    .map(|(a, _)| *a)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -208,7 +219,7 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
     sock.set_nonblocking(true)?;
     let fixed = match &o.to {
         Some(t) => {
-            let with_port = if t.contains(':') { t.clone() } else { format!("{t}:{}", protocol::AUDIO_PORT) };
+            let with_port = if t.contains(':') { t.clone() } else { format!("{t}:{}", o.port) };
             Some(with_port.to_socket_addrs()?.find(|a| a.is_ipv4()).ok_or_else(|| anyhow!("can't resolve {t}"))?)
         }
         None => None,
@@ -219,7 +230,7 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
     } else {
         None
     };
-    let mut router = Router { fixed, want_name: o.name.clone(), dir, receiver: None, paths: HashMap::new(), current: None, sh: sh.clone() };
+    let mut router = Router { fixed, port: o.port, want_name: o.name.clone(), dir, receiver: None, paths: HashMap::new(), current: None, sh: sh.clone() };
     sh.update(|s| {
         s.phase = Phase::Searching;
         s.device_name = cap.name.clone();

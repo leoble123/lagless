@@ -2,6 +2,8 @@
 
 pub const DISCOVERY_PORT: u16 = 47800;
 pub const AUDIO_PORT: u16 = 47801;
+/// Reverse direction: the Mac's microphone streamed to the PC.
+pub const MIC_PORT: u16 = 47802;
 /// Keep datagrams under a typical 1500-byte MTU (minus IP/UDP and VPN/PAN headroom).
 pub const MAX_PACKET: usize = 1400;
 

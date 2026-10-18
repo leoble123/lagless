@@ -74,6 +74,14 @@ pub struct Settings {
     pub quality: CodecChoice,
     pub fec: usize,
     pub frame_ms: f64,
+    // mic link (Mac mic -> PC)
+    /// Mac side: stream this Mac's mic to the PC.
+    pub mic_send: bool,
+    pub mic_device: Option<String>,
+    /// PC side: play the Mac's mic into a virtual cable.
+    pub mic_receive: bool,
+    /// None = auto-detect VB-Audio "CABLE Input".
+    pub mic_out: Option<String>,
     pub auto_update: bool,
 }
 
@@ -90,6 +98,10 @@ impl Default for Settings {
             quality: CodecChoice::Auto,
             fec: 1,
             frame_ms: 1.0,
+            mic_send: false,
+            mic_device: None,
+            mic_receive: true,
+            mic_out: None,
             auto_update: true,
         }
     }
@@ -130,57 +142,118 @@ struct Engine {
     handle: Option<JoinHandle<()>>,
 }
 
+type Job = Box<dyn FnOnce(Arc<Shared>) -> anyhow::Result<()> + Send>;
+
 impl Engine {
-    fn start(s: &Settings, ctx: egui::Context) -> Self {
+    fn spawn(name: &str, job: Job, ctx: egui::Context) -> Self {
         let shared = Shared::new();
         let sh = shared.clone();
-        let s = s.clone();
         let handle = std::thread::Builder::new()
-            .name("engine".into())
+            .name(name.into())
             .spawn(move || {
-                let result = match s.mode {
-                    Mode::Receive => receiver::run(
-                        receiver::Options {
-                            port: crate::protocol::AUDIO_PORT,
-                            device: s.out_device.clone(),
-                            min_latency_ms: s.min_latency,
-                            max_latency_ms: 120.0,
-                            buffer_frames: s.buffer,
-                            name: Some(s.rx_name.clone()).filter(|n| !n.trim().is_empty()),
-                            null_output: std::env::var_os("LAGLESS_NULL_OUTPUT").is_some(),
-                        },
-                        sh.clone(),
-                    ),
-                    Mode::Send => {
-                        let (source, device) = match &s.source {
-                            SourceSel::Loopback(d) => (Source::Loopback, d.clone()),
-                            SourceSel::Input(d) => (Source::Input, d.clone()),
-                            SourceSel::Tone => (Source::Tone, None),
-                        };
-                        sender::run(
-                            sender::Options {
-                                to: Some(s.to.trim().to_string()).filter(|t| !t.is_empty()),
-                                name: None,
-                                codec: s.quality,
-                                frame_ms: s.frame_ms,
-                                redundancy: s.fec,
-                                bitrate_kbps: 320,
-                                source,
-                                device,
-                                sim_loss: 0.0,
-                                tone_rate: 48000,
-                            },
-                            sh.clone(),
-                        )
-                    }
-                };
-                if let Err(e) = result {
+                if let Err(e) = job(sh.clone()) {
                     sh.update(|st| st.phase = Phase::Error(format!("{e:#}")));
                 }
                 ctx.request_repaint();
             })
             .ok();
         Engine { shared, handle }
+    }
+
+    fn start(s: &Settings, ctx: egui::Context) -> Self {
+        let s = s.clone();
+        let job: Job = match s.mode {
+            Mode::Receive => Box::new(move |sh| {
+                receiver::run(
+                    receiver::Options {
+                        port: crate::protocol::AUDIO_PORT,
+                        device: s.out_device.clone(),
+                        min_latency_ms: s.min_latency,
+                        max_latency_ms: 120.0,
+                        buffer_frames: s.buffer,
+                        name: Some(s.rx_name.clone()).filter(|n| !n.trim().is_empty()),
+                        null_output: std::env::var_os("LAGLESS_NULL_OUTPUT").is_some(),
+                    },
+                    sh,
+                )
+            }),
+            Mode::Send => Box::new(move |sh| {
+                let (source, device) = match &s.source {
+                    SourceSel::Loopback(d) => (Source::Loopback, d.clone()),
+                    SourceSel::Input(d) => (Source::Input, d.clone()),
+                    SourceSel::Tone => (Source::Tone, None),
+                };
+                sender::run(
+                    sender::Options {
+                        to: Some(s.to.trim().to_string()).filter(|t| !t.is_empty()),
+                        port: crate::protocol::AUDIO_PORT,
+                        name: None,
+                        codec: s.quality,
+                        frame_ms: s.frame_ms,
+                        redundancy: s.fec,
+                        bitrate_kbps: 320,
+                        source,
+                        device,
+                        sim_loss: 0.0,
+                        tone_rate: 48000,
+                    },
+                    sh,
+                )
+            }),
+        };
+        Engine::spawn("engine", job, ctx)
+    }
+
+    /// The reverse link: on the Mac (receive mode) send the mic; on the PC (send mode) play it
+    /// into a virtual cable that other apps use as their microphone.
+    fn start_mic(s: &Settings, ctx: egui::Context) -> Result<Option<Self>, String> {
+        let s = s.clone();
+        let job: Job = match s.mode {
+            Mode::Receive if s.mic_send => Box::new(move |sh| {
+                sender::run(
+                    sender::Options {
+                        to: None,
+                        port: crate::protocol::MIC_PORT,
+                        name: None,
+                        codec: CodecChoice::Auto,
+                        frame_ms: 1.0,
+                        redundancy: 1,
+                        bitrate_kbps: 192,
+                        source: if std::env::var_os("LAGLESS_TONE_MIC").is_some() { Source::Tone } else { Source::Input },
+                        device: s.mic_device.clone(),
+                        sim_loss: 0.0,
+                        tone_rate: 48000,
+                    },
+                    sh,
+                )
+            }),
+            Mode::Send if s.mic_receive => {
+                let out = match s.mic_out.clone().or_else(find_virtual_cable) {
+                    Some(o) => o,
+                    None => return Err("no virtual cable".into()),
+                };
+                // Playing the mic into the device we capture would loop it straight back.
+                if default_output_name().as_deref() == Some(out.as_str()) {
+                    return Err(format!("\"{out}\" is this PC's default output — pick a different default speaker in Windows sound settings"));
+                }
+                Box::new(move |sh| {
+                    receiver::run(
+                        receiver::Options {
+                            port: crate::protocol::MIC_PORT,
+                            device: Some(out),
+                            min_latency_ms: 2.0,
+                            max_latency_ms: 80.0,
+                            buffer_frames: 64,
+                            name: Some(format!("{} (mic)", crate::net::hostname())),
+                            null_output: std::env::var_os("LAGLESS_NULL_OUTPUT").is_some(),
+                        },
+                        sh,
+                    )
+                })
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(Engine::spawn("mic", job, ctx)))
     }
 
     fn stop(&mut self) {
@@ -196,6 +269,23 @@ impl Drop for Engine {
         self.stop();
     }
 }
+
+/// VB-Audio Virtual Cable's playback side (what apps hear as "CABLE Output").
+fn find_virtual_cable() -> Option<String> {
+    let host = cpal::default_host();
+    let names: Vec<String> = host.output_devices().ok()?.filter_map(|d| d.name().ok()).collect();
+    names
+        .iter()
+        .find(|n| n.to_lowercase().contains("cable input"))
+        .or_else(|| names.iter().find(|n| n.to_lowercase().contains("vb-audio")))
+        .cloned()
+}
+
+fn default_output_name() -> Option<String> {
+    cpal::default_host().default_output_device()?.name().ok()
+}
+
+const VB_CABLE_URL: &str = "https://vb-audio.com/Cable/";
 
 struct Devices {
     outputs: Vec<String>,
@@ -220,6 +310,10 @@ pub struct App {
     draft: Settings,
     engine: Engine,
     status: Status,
+    mic: Option<Engine>,
+    mic_status: Status,
+    mic_problem: Option<String>,
+    mic_level: f32,
     devices: Devices,
     updater: Updater,
     show_settings: bool,
@@ -236,7 +330,15 @@ impl App {
         style(&cc.egui_ctx);
         let settings = Settings::load();
         let engine = Engine::start(&settings, cc.egui_ctx.clone());
+        let (mic, mic_problem) = match Engine::start_mic(&settings, cc.egui_ctx.clone()) {
+            Ok(m) => (m, None),
+            Err(e) => (None, Some(e)),
+        };
         App {
+            mic,
+            mic_status: Status::default(),
+            mic_problem,
+            mic_level: 0.0,
             draft: settings.clone(),
             updater: Updater::start(settings.auto_update),
             settings,
@@ -258,6 +360,20 @@ impl App {
         self.engine.stop();
         self.history.clear();
         self.engine = Engine::start(&self.settings, ctx.clone());
+        self.restart_mic(ctx);
+    }
+
+    fn restart_mic(&mut self, ctx: &egui::Context) {
+        self.settings.save();
+        self.mic = None; // Drop stops it
+        self.mic_status = Status::default();
+        match Engine::start_mic(&self.settings, ctx.clone()) {
+            Ok(m) => {
+                self.mic = m;
+                self.mic_problem = None;
+            }
+            Err(e) => self.mic_problem = Some(e),
+        }
     }
 
     fn tick(&mut self, now: f64) {
@@ -273,6 +389,17 @@ impl App {
             if db >= self.peaks[c].0 || now - self.peaks[c].1 > 1.2 {
                 self.peaks[c] = (db, now);
             }
+        }
+        if let Some(m) = &self.mic {
+            self.mic_status = m.shared.snapshot();
+            let pk = m.shared.take_levels();
+            let db = to_meter(pk[0].max(pk[1]));
+            self.mic_level = if db > self.mic_level { db } else { (self.mic_level - 0.025).max(db) };
+            if let Some(e) = m.shared.take_events().pop() {
+                self.toast = Some((format!("Mic: {e}"), now));
+            }
+        } else {
+            self.mic_level = 0.0;
         }
         if now - self.last_sample > 0.25 {
             self.last_sample = now;
@@ -310,6 +437,10 @@ impl eframe::App for App {
                 ui.add_space(12.0);
                 self.chips(ui);
                 ui.add_space(12.0);
+                if !self.show_settings {
+                    self.mic_card(ui, &ctx);
+                    ui.add_space(10.0);
+                }
                 if self.show_settings {
                     egui::ScrollArea::vertical().max_height(ui.available_height() - 44.0).show(ui, |ui| self.settings_card(ui, &ctx));
                 } else {
@@ -322,11 +453,13 @@ impl eframe::App for App {
 
         // Animate smoothly while there's something moving, otherwise idle cheaply.
         let busy = matches!(self.status.phase, Phase::Streaming | Phase::Searching | Phase::Starting)
-            || self.levels.iter().any(|l| *l > 0.0);
+            || self.levels.iter().any(|l| *l > 0.0)
+            || self.mic_level > 0.0;
         ctx.request_repaint_after(if busy { Duration::from_millis(16) } else { Duration::from_millis(250) });
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.mic = None;
         self.engine.stop();
         // Quitting with an update downloaded installs it, so the next launch is the new version.
         if matches!(self.updater.state(), update::State::Ready(_)) {
@@ -366,7 +499,7 @@ impl App {
     }
 
     fn hero(&self, ui: &mut Ui, now: f64) {
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 230.0), Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 210.0), Sense::hover());
         let p = ui.painter_at(rect);
         let c = rect.center();
         let st = &self.status;
@@ -475,6 +608,72 @@ impl App {
         });
     }
 
+    fn mic_card(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        let mode = self.settings.mode;
+        let ms = self.mic_status.clone();
+        let mut toggled = false;
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (on, title) = match mode {
+                    Mode::Receive => (&mut self.settings.mic_send, "Send this Mac's mic to the PC"),
+                    Mode::Send => (&mut self.settings.mic_receive, "Use the Mac's mic on this PC"),
+                };
+                if toggle(ui, on).clicked() {
+                    toggled = true;
+                }
+                ui.label(RichText::new(title).size(13.0).color(TEXT));
+            });
+            let active = self.mic.is_some();
+            let status = match (&ms.phase, active) {
+                (_, false) => match (&self.mic_problem, mode) {
+                    (Some(p), Mode::Send) if p == "no virtual cable" => None,
+                    (Some(p), _) => Some((p.clone(), BAD)),
+                    _ => Some(("Off".into(), DIM)),
+                },
+                (Phase::Error(e), _) => Some((e.clone(), BAD)),
+                (Phase::Streaming, _) => {
+                    let lat = if ms.latency_ms > 0.0 { format!(" · {:.0} ms", ms.latency_ms) } else { String::new() };
+                    let dir = if mode == Mode::Receive { "to" } else { "from" };
+                    Some((format!("{dir} {} via {}{lat}", ms.peer_name, ms.link.label()), GOOD))
+                }
+                (Phase::Idle, _) => Some(("Connected — no mic audio".into(), OK)),
+                _ => Some((if mode == Mode::Receive { "Looking for the PC…" } else { "Waiting for the Mac…" }.into(), BLUE)),
+            };
+            if let Some((text, col)) = status {
+                ui.label(RichText::new(text).size(11.5).color(col));
+            }
+            if active {
+                let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 5.0), Sense::hover());
+                ui.painter().rect_filled(r, CornerRadius::same(3), BG);
+                let lit = Rect::from_min_size(r.min, vec2(r.width() * self.mic_level, r.height()));
+                if lit.width() > 0.5 {
+                    gradient_rect(ui.painter(), lit, r.width(), &[TEAL, BLUE, VIOLET, PINK]);
+                }
+            }
+            match mode {
+                Mode::Send if self.mic_problem.as_deref() == Some("no virtual cable") && self.settings.mic_receive => {
+                    hint(ui, "Windows apps need a virtual mic for this. Install the free VB-Audio Virtual Cable, then click Retry.");
+                    ui.horizontal(|ui| {
+                        if accent_button(ui, "Get VB-Cable").clicked() {
+                            ctx.open_url(egui::OpenUrl::new_tab(VB_CABLE_URL));
+                        }
+                        if ui.button("Retry").clicked() {
+                            toggled = true;
+                        }
+                    });
+                }
+                Mode::Send if active => hint(ui, "In Discord, Zoom, OBS… choose \"CABLE Output\" as your microphone."),
+                Mode::Receive if active => hint(ui, "Tip: use headphones/IEMs on the Mac, or the PC app's echo cancellation, to avoid echo."),
+                _ => {}
+            }
+        });
+        if toggled {
+            self.draft.mic_send = self.settings.mic_send;
+            self.draft.mic_receive = self.settings.mic_receive;
+            self.restart_mic(ctx);
+        }
+    }
+
     fn graph(&self, ui: &mut Ui) {
         card(ui, |ui| {
             let vals: Vec<f32> = self.history.iter().copied().collect();
@@ -581,6 +780,14 @@ impl App {
                         }
                     });
                     hint(ui, "Lower = less delay. Raise these if you hear crackles.");
+                    section(ui, "MICROPHONE (SENT TO THE PC)");
+                    let label = d.mic_device.clone().unwrap_or_else(|| "System default mic".into());
+                    egui::ComboBox::from_id_salt("mic").width(ui.available_width()).selected_text(label).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut d.mic_device, None, "System default mic");
+                        for n in &self.devices.inputs {
+                            ui.selectable_value(&mut d.mic_device, Some(n.clone()), n);
+                        }
+                    });
                     section(ui, "NAME ON THE NETWORK");
                     ui.add(egui::TextEdit::singleline(&mut d.rx_name).hint_text(crate::net::hostname()).desired_width(f32::INFINITY));
                 }
@@ -615,6 +822,14 @@ impl App {
                     hint(ui, "Auto = 24-bit lossless, falling back to Opus only if the link drops audio.");
                     ui.add(egui::Slider::new(&mut d.fec, 0..=4).text("loss protection"));
                     ui.add(egui::Slider::new(&mut d.frame_ms, 0.5..=5.0).step_by(0.5).suffix(" ms frames"));
+                    section(ui, "MAC MIC PLAYS INTO");
+                    let label = d.mic_out.clone().unwrap_or_else(|| "Auto (VB-Audio CABLE Input)".into());
+                    egui::ComboBox::from_id_salt("micout").width(ui.available_width()).selected_text(label).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut d.mic_out, None, "Auto (VB-Audio CABLE Input)");
+                        for n in &self.devices.outputs {
+                            ui.selectable_value(&mut d.mic_out, Some(n.clone()), n);
+                        }
+                    });
                     section(ui, "RECEIVER");
                     ui.add(egui::TextEdit::singleline(&mut d.to).hint_text("Automatic — or type the Mac's IP").desired_width(f32::INFINITY));
                 }
@@ -776,6 +991,22 @@ fn section(ui: &mut Ui, s: &str) {
     ui.label(RichText::new(s).size(10.5).color(DIM).strong());
 }
 
+/// iOS-style switch with an animated knob.
+fn toggle(ui: &mut Ui, on: &mut bool) -> egui::Response {
+    let (r, mut resp) = ui.allocate_exact_size(vec2(36.0, 20.0), Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let t = ui.ctx().animate_bool_responsive(resp.id, *on);
+    let p = ui.painter();
+    let track = if *on { TEAL } else { Color32::from_rgb(44, 48, 62) };
+    p.rect_filled(r, CornerRadius::same(10), track.gamma_multiply(if *on { 0.9 } else { 1.0 }));
+    let x = egui::lerp((r.min.x + 10.0)..=(r.max.x - 10.0), t);
+    p.circle_filled(pos2(x, r.center().y), 7.5, if *on { BG } else { DIM });
+    resp
+}
+
 fn hint(ui: &mut Ui, s: &str) {
     ui.label(RichText::new(s).size(11.0).color(DIM.gamma_multiply(0.8)));
 }
@@ -868,8 +1099,8 @@ pub fn run() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("lagless")
-            .with_inner_size([440.0, 700.0])
-            .with_min_inner_size([380.0, 600.0])
+            .with_inner_size([440.0, 800.0])
+            .with_min_inner_size([380.0, 680.0])
             .with_icon(Arc::new(app_icon())),
         ..Default::default()
     };

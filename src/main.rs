@@ -33,6 +33,9 @@ enum Cmd {
         /// Receiver address (skips auto-discovery), e.g. 192.168.1.20 or 169.254.10.2:47801
         #[arg(long)]
         to: Option<String>,
+        /// Receiver port (47801 = speakers, 47802 = mic link)
+        #[arg(long, default_value_t = protocol::AUDIO_PORT)]
+        port: u16,
         /// Pick a receiver by (part of) its name when several are running
         #[arg(long)]
         name: Option<String>,
@@ -118,8 +121,8 @@ fn run() -> Result<()> {
     let sh = engine::Shared::new();
     let worker = sh.clone();
     let job: Box<dyn FnOnce() -> Result<()> + Send> = match cmd {
-        Cmd::Send { to, name, codec, frame_ms, fec, bitrate, source, device, sim_loss, tone_rate } => {
-            let o = sender::Options { to, name, codec, frame_ms, redundancy: fec.min(8), bitrate_kbps: bitrate, source, device, sim_loss, tone_rate };
+        Cmd::Send { to, port, name, codec, frame_ms, fec, bitrate, source, device, sim_loss, tone_rate } => {
+            let o = sender::Options { to, port, name, codec, frame_ms, redundancy: fec.min(8), bitrate_kbps: bitrate, source, device, sim_loss, tone_rate };
             Box::new(move || sender::run(o, worker))
         }
         Cmd::Receive { port, device, min_latency, max_latency, buffer, name, null_output } => {
