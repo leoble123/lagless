@@ -56,20 +56,55 @@ True zero isn't physically possible, but the goal is to get under what you can p
 
 | Link | Typical |
 |---|---|
-| Ethernet / USB-Ethernet / Thunderbolt bridge | **~12–18 ms** |
-| 5 GHz Wi-Fi, good signal | ~15–30 ms |
+| Ethernet cable (direct or via a router) | **~7–12 ms** with the Windows engine trick, ~12–18 ms without |
+| 5 GHz Wi-Fi, good signal | ~12–30 ms |
 | Bluetooth PAN (auto-switches to Opus) | ~50 ms+ |
 
-Where the time goes on a cable: Windows' audio engine hands loopback audio over in roughly 10 ms chunks (the biggest piece, and outside lagless's control). The rest is about 1 ms for the frame, under 0.5 ms on the network, 2–5 ms in the jitter buffer, and about 1.3 ms in the Mac's device buffer. For comparison, lip-sync errors become noticeable at about 45 ms, so wired and good Wi-Fi are both well under that.
+Where the time goes on a cable: Windows hands loopback audio over once per audio-engine period, which is 10 ms normally and about 2.7 ms with the trick below. The rest is about 1 ms for the frame, under 0.5 ms on the wire, a 2–5 ms jitter buffer, and about 0.7 ms of Mac device buffer plus the Mac's own output latency. Lip-sync errors become noticeable at about 45 ms.
+
+## Latency tricks lagless uses
+
+On by default:
+- **Windows audio-engine speed-up.** Windows mixes audio in 10 ms chunks, and loopback capture can't be faster than that. But the engine runs each speaker device at the smallest period any app requests through the low-latency API (`IAudioClient3`, Windows 10+). So lagless quietly plays silence at the minimum period, often 128 samples (2.7 ms) at 48 kHz, which makes the whole engine and the capture 3–4x more frequent. Details shows *Windows engine: 2.7 ms (sped up from 10.0)* when it works. Some third-party drivers don't allow it; nothing changes then.
+- **Two links at once.** With a cable and Wi-Fi both up, every packet goes over both, and the first copy to arrive wins. A hiccup on one link costs nothing.
+- **Frames that fit the capture.** Frame size is matched to Windows' chunk size, so no leftover partial frame waits for the next chunk.
+- **Scheduling.** On Windows: 1 ms timer resolution, high process priority, and the "Pro Audio" thread class for the audio threads. On the Mac: user-interactive priority for the network thread.
+- **Small Mac buffer.** A 32-sample device buffer (0.7 ms at 48 kHz).
+- **Smarter jitter buffer.** It waits about 300 ms at the start of a stream to measure how bursty arrivals are, instead of guessing and glitching once. After a hiccup it covers that hiccup for 20 s, then walks back down to the floor within seconds.
+
+In settings (sliders icon → *Latency tweaks*):
+- **Lowest latency** (Mac): forget network hiccups after 4 s instead of 20 s. You'll get lower latency most of the time, and an occasional glitch if your network has periodic spikes.
+- **Stop AirDrop Wi-Fi hopping** (Mac, Wi-Fi only): AirDrop/Continuity makes the Mac's Wi-Fi radio hop channels about once a second, which shows up as regular latency spikes. This turns that radio off (`ifconfig awdl0 down`, admin password needed) until you restart or use AirDrop.
+- **Device buffer** (Mac): try 16 for the absolute minimum. Go back up if you hear crackles.
+
+Worth doing by hand on Windows:
+- **Turn off audio enhancements** for your output device (Settings → System → Sound → device → *Audio enhancements: Off*). Enhancement plug-ins add processing delay and can stop the engine speed-up from working.
+- **Use 48 kHz** as the Windows output format. The low-latency period is most widely supported there.
+- **Mic link:** in VB-Cable's control panel (*VBCABLE_ControlPanel*, run as administrator), lower the latency/buffer setting if your version offers it. Its default buffer is generous.
+
+## Using a cable
+
+A cable is the most stable link and has the lowest latency. lagless switches to it automatically when it appears, and keeps Wi-Fi as a backup.
+
+**What you need:** an Ethernet cable (any Cat5e/Cat6; no "crossover" cable needed) and Ethernet ports on both machines.
+- **iMac:** Intel 21.5"/27" iMacs have Ethernet on the back. On the 24" Apple Silicon iMac, it's on the power adapter if yours came with that one; otherwise use a USB-C to Ethernet adapter (about $15–20).
+- **PC:** the motherboard's Ethernet port. If it's already used for internet, either use a USB Ethernet adapter for the Mac link, or use option A below.
+- A plain USB-C-to-USB-C cable between the two **won't** work: it doesn't create a network connection between a PC and a Mac.
+
+**Option A, both into your router (easiest):** plug the PC and the iMac into the router or a switch. Done. Internet keeps working on both.
+
+**Option B, PC straight to iMac (lowest latency, no router hop):**
+1. Connect the cable. Leave Wi-Fi on for internet.
+2. Wait about 30–60 seconds. Both machines give themselves a `169.254.x.x` address automatically. Windows calls it an "Unidentified network" and the Mac shows "Self-assigned IP" with a yellow dot. Both are normal, so don't change them.
+3. On the PC, open lagless settings → **Allow lagless on all networks…** and approve the prompt, once. Windows treats a direct cable as a Public network. Sound to the Mac works without this, but the mic link needs it.
+4. Check **Details** on either side: *Link: Cable* and a round trip of about 0.2–0.5 ms.
 
 ## Getting the best result
 
-1. **Use a cable if you can.** Wired is the most stable link and has the lowest latency.
-   - **"USB":** the most reliable way is a USB-C or USB-A Ethernet adapter plugged into the Mac, with a short Ethernet cable straight to the PC's Ethernet port. No router or IP setup is needed: both sides give themselves 169.254.x.x addresses and lagless finds the link.
-   - A Thunderbolt/USB4 cable between two Thunderbolt machines also works if both show a Thunderbolt Bridge network.
-2. **Pick your hi-res rate on the PC:** Settings → System → Sound → your output device → Output settings → Format → for example, *24 bit, 96000 Hz*. lagless follows whatever Windows uses.
-3. **For IEMs or a DAC/interface on the Mac:** `./lagless receive --device "<part of its name>"`. Run `./lagless devices` to list the names. Leave Mac volume at 100% and use your amp's volume for the cleanest signal.
-4. **On Wi-Fi:** use 5 GHz, keep the Mac near the router, and turn off VPNs. lagless marks its packets as "voice" traffic, which Wi-Fi routers prioritise.
+1. **Use a cable if you can** (see above).
+2. **Pick your hi-res rate on the PC:** Settings → System → Sound → your output device → Output settings → Format → for example, *24 bit, 96000 Hz*. lagless follows whatever Windows uses. 48 kHz gives the lowest latency (see above).
+3. **For IEMs or a DAC/interface on the Mac:** choose it under Output in settings. Leave Mac volume at 100% and use lagless's volume slider or your amp for level.
+4. **On Wi-Fi:** use 5 GHz, keep the Mac near the router, turn off VPNs, and try *Stop AirDrop Wi-Fi hopping*. lagless marks its packets as "voice" traffic, which Wi-Fi routers prioritise.
 
 ## Command line
 
@@ -78,7 +113,8 @@ The same binary works headless when given arguments (on a Mac: `/Applications/La
 ```
 lagless send     [--to 192.168.1.20] [--port 47801|47802] [--name studio] [--codec auto|pcm24|pcm16|opus]
                  [--frame-ms 1.0] [--fec 1] [--bitrate 320] [--source loopback|input|tone] [--device NAME]
-lagless receive  [--device NAME] [--min-latency 2] [--max-latency 120] [--buffer 64] [--name NAME]
+                 [--no-multipath] [--no-engine-boost]
+lagless receive  [--device NAME] [--min-latency 2] [--max-latency 120] [--buffer 32] [--lowest] [--name NAME]
 lagless devices
 lagless update
 ```

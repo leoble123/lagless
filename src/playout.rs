@@ -26,6 +26,9 @@ pub struct Stats {
     /// Set by the network thread when a frame flagged "source resumed after silence" arrives.
     pub discont: AtomicBool,
     pub playing: AtomicBool,
+    /// Set once the network thread has seen enough packets to know how bursty arrivals are.
+    /// Until then playback waits, instead of starting blind and underrunning once.
+    pub warm: AtomicBool,
 }
 
 /// Linear gain shared with the UI thread, stored as f32 bits so the slider applies instantly.
@@ -215,7 +218,7 @@ impl Playout {
 
         if !self.playing {
             // Starting right on a burst peak would leave the average half a gap short.
-            if fill < self.target + gap * 0.5 {
+            if fill < self.target + gap * 0.5 || !self.stats.warm.load(Relaxed) {
                 self.write_tail(out, 0);
                 return;
             }
@@ -268,9 +271,11 @@ impl Playout {
         }
 
         self.calm_secs += cb_secs;
-        if self.calm_secs > 15.0 {
+        // The floor already covers the worst recent gap; after a quiet spell, walk back down to
+        // it so a one-off hiccup doesn't leave extra latency behind for long.
+        if self.calm_secs > 2.0 {
             self.calm_secs = 0.0;
-            self.target = (self.target * 0.85).max(min_target);
+            self.target = (self.target * 0.9).max(min_target);
         }
     }
 
@@ -287,7 +292,7 @@ impl Playout {
             // If the sender told us it had paused, the gap wasn't the network's fault.
             if !self.stats.discont.swap(false, Relaxed) {
                 self.stats.underruns.fetch_add(1, Relaxed);
-                self.target = (self.target * 1.5 + 0.001 * self.src_rate).min(self.max_target);
+                self.target = (self.target * 1.15 + 0.0005 * self.src_rate).min(self.max_target);
             }
         }
     }
@@ -344,6 +349,7 @@ mod tests {
 
     fn stats(frame_us: u32, gap_us: u32) -> Arc<Stats> {
         let s = Arc::new(Stats::default());
+        s.warm.store(true, Relaxed);
         s.frame_us.store(frame_us, Relaxed);
         s.arrival_gap_us.store(gap_us, Relaxed);
         s

@@ -64,6 +64,16 @@ pub struct Settings {
     pub mic_receive: bool,
     /// None = auto-detect VB-Audio "CABLE Input".
     pub mic_out: Option<String>,
+    /// Receiver: forget latency spikes after 4 s instead of 20 s.
+    pub lowest_latency: bool,
+    /// Send each packet over two links at once when two are available.
+    pub multipath: bool,
+    /// Windows: drive the audio engine at its minimum period (see boost.rs).
+    pub engine_boost: bool,
+    /// Bumped when defaults change in a way saved settings should pick up. Field-level default
+    /// (0) so files written before it existed get migrated.
+    #[serde(default)]
+    pub tuning: u32,
     /// Volume slider position, 0..1 (see `Volume::slider_to_gain`).
     pub volume: f32,
     pub auto_update: bool,
@@ -75,7 +85,7 @@ impl Default for Settings {
             mode: if cfg!(windows) { Mode::Send } else { Mode::Receive },
             out_device: None,
             min_latency: 2.0,
-            buffer: 64,
+            buffer: 32,
             rx_name: String::new(),
             source: if cfg!(windows) { SourceSel::Loopback(None) } else { SourceSel::Input(None) },
             to: String::new(),
@@ -86,6 +96,10 @@ impl Default for Settings {
             mic_device: None,
             mic_receive: true,
             mic_out: None,
+            lowest_latency: false,
+            multipath: true,
+            engine_boost: true,
+            tuning: 1,
             volume: 1.0,
             auto_update: true,
         }
@@ -106,10 +120,19 @@ fn settings_path() -> Option<std::path::PathBuf> {
 
 impl Settings {
     fn load() -> Self {
-        settings_path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        settings_path().and_then(|p| std::fs::read_to_string(p).ok()).map(|j| Self::from_json(&j)).unwrap_or_default()
+    }
+
+    fn from_json(json: &str) -> Self {
+        let mut s: Settings = serde_json::from_str(json).unwrap_or_default();
+        // v0.4: the Mac device buffer default went 64 -> 32 frames; move people still on the old default.
+        if s.tuning < 1 {
+            if s.buffer == 64 {
+                s.buffer = 32;
+            }
+            s.tuning = 1;
+        }
+        s
     }
 
     fn save(&self) {
@@ -160,6 +183,7 @@ impl Engine {
                         buffer_frames: s.buffer,
                         name: Some(s.rx_name.clone()).filter(|n| !n.trim().is_empty()),
                         null_output: std::env::var_os("LAGLESS_NULL_OUTPUT").is_some(),
+                        spike_memory_secs: if s.lowest_latency { 4 } else { 20 },
                     },
                     sh,
                 )
@@ -183,6 +207,8 @@ impl Engine {
                         device,
                         sim_loss: 0.0,
                         tone_rate: 48000,
+                        multipath: s.multipath,
+                        engine_boost: s.engine_boost,
                     },
                     sh,
                 )
@@ -210,6 +236,8 @@ impl Engine {
                         device: s.mic_device.clone(),
                         sim_loss: 0.0,
                         tone_rate: 48000,
+                        multipath: s.multipath,
+                        engine_boost: false,
                     },
                     sh,
                 )
@@ -230,9 +258,10 @@ impl Engine {
                             device: Some(out),
                             min_latency_ms: 2.0,
                             max_latency_ms: 80.0,
-                            buffer_frames: 64,
+                            buffer_frames: 32,
                             name: Some(format!("{} (mic)", crate::net::hostname())),
                             null_output: std::env::var_os("LAGLESS_NULL_OUTPUT").is_some(),
+                            spike_memory_secs: 4, // voice: snappy beats steady
                         },
                         sh,
                     )
@@ -595,8 +624,14 @@ impl App {
                 if st.rtt_ms > 0.0 {
                     row(ui, "Round trip", format!("{:.2} ms", st.rtt_ms));
                 }
+                if st.engine_ms > 0.0 {
+                    row(ui, "Windows engine", format!("{:.1} ms (sped up from {:.1})", st.engine_ms, st.engine_default_ms));
+                }
                 if st.target_ms > 0.0 {
                     row(ui, "Buffer", format!("{:.1} ms (target {:.1})", st.buffer_ms, st.target_ms));
+                }
+                if st.jitter_ms > 0.0 {
+                    row(ui, "Arrival jitter", format!("{:.1} ms", st.jitter_ms));
                 }
                 row(ui, "Dropouts", format!("{} repaired · {} lost · {} rebuffers", st.fixed, st.lost, st.underruns));
             });
@@ -621,7 +656,7 @@ impl App {
                     ui.add(egui::Slider::new(&mut d.min_latency, 0.0..=40.0).suffix(" ms min buffer").step_by(0.5));
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Device buffer").color(DIM));
-                        for b in [32u32, 64, 128, 256, 512] {
+                        for b in [16u32, 32, 64, 128, 256] {
                             ui.selectable_value(&mut d.buffer, b, b.to_string());
                         }
                     });
@@ -679,6 +714,42 @@ impl App {
                     section(ui, "RECEIVER");
                     ui.add(egui::TextEdit::singleline(&mut d.to).hint_text("Automatic — or type the Mac's IP").desired_width(f32::INFINITY));
                 }
+            }
+            section(ui, "LATENCY TWEAKS");
+            if d.mode == Mode::Receive {
+                ui.checkbox(&mut d.lowest_latency, "Lowest latency (may glitch on network hiccups)");
+                hint(ui, "Off: a hiccup raises the buffer for ~20 s so it can't repeat. On: only ~4 s.");
+            }
+            ui.checkbox(&mut d.multipath, "Send over two links at once");
+            hint(ui, "With a cable and Wi-Fi both connected, every packet goes both ways and the first to arrive wins.");
+            if cfg!(windows) {
+                ui.checkbox(&mut d.engine_boost, "Speed up the Windows audio engine");
+                let st = &self.status;
+                if st.engine_ms > 0.0 {
+                    hint(ui, &format!("Active: {:.1} ms instead of {:.1} ms per chunk.", st.engine_ms, st.engine_default_ms));
+                } else {
+                    hint(ui, "Asks Windows for its smallest audio period (often 2.7 ms instead of 10). Not every driver allows it.");
+                }
+                #[cfg(windows)]
+                if ui.button("Allow lagless on all networks…").clicked() {
+                    let msg = match crate::net::open_firewall() {
+                        Ok(()) => "Firewall updated — lagless works over a direct cable now".to_string(),
+                        Err(e) => format!("Firewall not changed: {e:#}"),
+                    };
+                    self.toast = Some((msg, ctx.input(|i| i.time)));
+                }
+                hint(ui, "Windows treats a direct cable as a Public network. Fixes that in one admin prompt; needed for the mic link over a cable.");
+            }
+            #[cfg(target_os = "macos")]
+            {
+                if ui.button("Stop AirDrop Wi-Fi hopping…").clicked() {
+                    let msg = match crate::net::disable_awdl() {
+                        Ok(()) => "AirDrop radio off until restart — fewer Wi-Fi spikes".to_string(),
+                        Err(e) => format!("Not changed: {e:#}"),
+                    };
+                    self.toast = Some((msg, ctx.input(|i| i.time)));
+                }
+                hint(ui, "On Wi-Fi, AirDrop makes the Mac's radio hop channels about once a second, which causes latency spikes. Lasts until restart.");
             }
             section(ui, "UPDATES");
             ui.horizontal(|ui| {
@@ -898,4 +969,22 @@ pub fn run() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native("lagless", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Settings;
+
+    #[test]
+    fn migrates_old_buffer_default_only() {
+        // Written by v0.3: old default buffer, no `tuning` field.
+        let s = Settings::from_json(r#"{"mode":"Receive","buffer":64,"volume":0.4}"#);
+        assert_eq!((s.buffer, s.tuning, s.volume), (32, 1, 0.4));
+        // A deliberate non-default choice is kept.
+        assert_eq!(Settings::from_json(r#"{"buffer":256}"#).buffer, 256);
+        // Already migrated: a later choice of 64 sticks.
+        assert_eq!(Settings::from_json(r#"{"buffer":64,"tuning":1}"#).buffer, 64);
+        // Fresh install.
+        assert_eq!(Settings::from_json("").buffer, 32);
+    }
 }

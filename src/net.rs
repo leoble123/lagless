@@ -89,17 +89,22 @@ pub fn spawn_beacon(receiver_id: u64, name: String, audio_port: u16, alive: Weak
     let sock = udp_socket(0, true, false)?;
     let pkt = protocol::write_beacon(&Beacon { receiver_id, audio_port, name });
     std::thread::Builder::new().name("beacon".into()).spawn(move || while alive.upgrade().is_some() {
-        let mut targets = vec![Ipv4Addr::BROADCAST, Ipv4Addr::LOCALHOST];
-        for i in v4_interfaces() {
-            // Directed broadcast reaches link-local (cable/USB) and PAN (Bluetooth) subnets too.
-            targets.push(Ipv4Addr::from(u32::from(i.ip) | !u32::from(i.mask)));
-        }
-        for t in targets {
+        for t in broadcast_targets() {
             let _ = sock.send_to(&pkt, (t, DISCOVERY_PORT));
         }
         std::thread::sleep(Duration::from_secs(1));
     })?;
     Ok(())
+}
+
+/// Every IPv4 broadcast address worth shouting at, plus loopback for same-machine testing.
+/// Directed broadcast reaches link-local (cable/USB) and PAN (Bluetooth) subnets too.
+fn broadcast_targets() -> Vec<Ipv4Addr> {
+    let mut targets = vec![Ipv4Addr::BROADCAST, Ipv4Addr::LOCALHOST];
+    for i in v4_interfaces() {
+        targets.push(Ipv4Addr::from(u32::from(i.ip) | !u32::from(i.mask)));
+    }
+    targets
 }
 
 pub struct Seen {
@@ -119,7 +124,18 @@ pub fn spawn_listener() -> Result<Directory> {
     let weak = Arc::downgrade(&dir);
     std::thread::Builder::new().name("discovery".into()).spawn(move || {
         let mut buf = [0u8; 512];
+        let mut last_probe = Instant::now() - Duration::from_secs(10);
         loop {
+            // Ask as well as listen: answers to our own broadcast get through firewalls that
+            // block unsolicited beacons (Windows treats a direct cable as a Public network).
+            if last_probe.elapsed() >= Duration::from_secs(1) {
+                last_probe = Instant::now();
+                for t in broadcast_targets() {
+                    for port in [protocol::AUDIO_PORT, protocol::MIC_PORT] {
+                        let _ = sock.send_to(protocol::MAGIC_PROBE, (t, port));
+                    }
+                }
+            }
             let res = sock.recv_from(&mut buf);
             let Some(d) = weak.upgrade() else { return };
             let Ok((n, src)) = res else { continue };
@@ -135,6 +151,40 @@ pub fn spawn_listener() -> Result<Directory> {
         }
     })?;
     Ok(dir)
+}
+
+/// Windows: replace whatever the first-run firewall prompt created (often "allow on Private,
+/// block on Public") with one rule allowing lagless on every network. One UAC prompt.
+#[cfg(windows)]
+pub fn open_firewall() -> Result<()> {
+    use windows::core::{w, HSTRING};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    let exe = std::env::current_exe()?.display().to_string();
+    let args = format!(
+        "/c netsh advfirewall firewall delete rule name=all program=\"{exe}\" & \
+         netsh advfirewall firewall add rule name=\"lagless\" dir=in action=allow program=\"{exe}\" enable=yes profile=any"
+    );
+    let r = unsafe { ShellExecuteW(None, w!("runas"), w!("cmd.exe"), &HSTRING::from(args), None, SW_HIDE) };
+    if r.0 as isize <= 32 {
+        anyhow::bail!("Windows didn't run the firewall change (cancelled?)");
+    }
+    Ok(())
+}
+
+/// macOS: AWDL (the AirDrop/Continuity radio) makes Wi-Fi hop channels about once a second,
+/// which shows up as regular latency spikes. Turning it off lasts until reboot or until
+/// AirDrop is next used. Asks for an admin password.
+#[cfg(target_os = "macos")]
+pub fn disable_awdl() -> Result<()> {
+    let ok = std::process::Command::new("osascript")
+        .args(["-e", "do shell script \"/sbin/ifconfig awdl0 down\" with administrator privileges"])
+        .status()?
+        .success();
+    if !ok {
+        anyhow::bail!("cancelled");
+    }
+    Ok(())
 }
 
 pub fn hostname() -> String {

@@ -92,6 +92,11 @@ pub struct Status {
     pub lost: u32,
     pub underruns: u32,
     pub fec: usize,
+    /// Windows audio engine period with the low-latency trick active, and what it was (ms).
+    pub engine_ms: f32,
+    /// Receiver: worst gap between packets over the last few seconds (what the buffer must cover).
+    pub jitter_ms: f32,
+    pub engine_default_ms: f32,
 }
 
 impl Default for Status {
@@ -116,6 +121,9 @@ impl Default for Status {
             lost: 0,
             underruns: 0,
             fec: 0,
+            engine_ms: 0.0,
+            jitter_ms: 0.0,
+            engine_default_ms: 0.0,
         }
     }
 }

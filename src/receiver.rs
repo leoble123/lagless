@@ -25,6 +25,9 @@ pub struct Options {
     pub name: Option<String>,
     /// Debug: no sound card, drive playback from a timer instead.
     pub null_output: bool,
+    /// How long a packet-gap spike keeps the buffer floor raised. Longer = steadier, shorter =
+    /// lower latency with the odd glitch on hiccups.
+    pub spike_memory_secs: usize,
 }
 
 /// After this many lost frames in a row, stop inventing audio and let the buffer rebuffer.
@@ -35,6 +38,7 @@ struct Session {
     sender: SocketAddr,
     info: Option<Info>,
     last_packet: Instant,
+    created: Instant,
     /// Worst packet inter-arrival gap this second, and for the last few seconds.
     gap_now_us: u32,
     gap_hist: std::collections::VecDeque<u32>,
@@ -59,12 +63,15 @@ struct Session {
 }
 
 pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
+    crate::boost::thread();
     let sock = net::udp_socket(o.port, false, false)
         .map_err(|e| anyhow!("Can't listen on UDP port {} ({e}). Is another copy of lagless receiving?", o.port))?;
     sock.set_read_timeout(Some(Duration::from_millis(50)))?;
     let name = o.name.clone().unwrap_or_else(net::hostname);
     let alive = Arc::new(());
-    net::spawn_beacon(net::random_u64(), name.clone(), o.port, Arc::downgrade(&alive))?;
+    let my_id = net::random_u64();
+    net::spawn_beacon(my_id, name.clone(), o.port, Arc::downgrade(&alive))?;
+    let my_beacon = protocol::write_beacon(&protocol::Beacon { receiver_id: my_id, audio_port: o.port, name: name.clone() });
     sh.update(|s| {
         s.phase = Phase::Searching;
         s.peer_name.clear();
@@ -79,7 +86,9 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
         match sock.recv_from(&mut buf) {
             Ok((n, src)) => {
                 let pkt = &buf[..n];
-                if let Some(t) = protocol::parse_ping(protocol::MAGIC_PING, pkt) {
+                if pkt == protocol::MAGIC_PROBE {
+                    let _ = sock.send_to(&my_beacon, src);
+                } else if let Some(t) = protocol::parse_ping(protocol::MAGIC_PING, pkt) {
                     let _ = sock.send_to(&protocol::write_ping(protocol::MAGIC_PONG, t), src);
                 } else if let Some(info) = protocol::parse_info(pkt) {
                     if let Some(s) = session.as_mut().filter(|s| s.header.stream_id == info.stream_id) {
@@ -125,7 +134,7 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
                 let r = s.report();
                 if last_report.elapsed() >= Duration::from_secs(1) {
                     last_report = Instant::now();
-                    s.roll_gap_window();
+                    s.roll_gap_window(o.spike_memory_secs);
                     let _ = sock.send_to(&protocol::write_report(&r), s.sender);
                 }
                 s.publish(&r);
@@ -238,6 +247,7 @@ impl Session {
             device_name,
             shared,
             last_packet: Instant::now(),
+            created: Instant::now(),
             gap_now_us: 0,
             gap_hist: Default::default(),
             _output: output,
@@ -259,6 +269,10 @@ impl Session {
     }
 
     fn note_arrival(&mut self) {
+        // ~300 ms of arrivals is enough to see the sender's burst pattern (one-off per stream).
+        if self.created.elapsed() > Duration::from_millis(300) {
+            self.stats.warm.store(true, Relaxed);
+        }
         let gap = self.last_packet.elapsed().as_micros() as u32;
         self.last_packet = Instant::now();
         // Longer gaps are the PC going quiet, not jitter.
@@ -270,10 +284,10 @@ impl Session {
         }
     }
 
-    /// Called once a second: the buffer floor follows the worst gap of the last 5 seconds.
-    fn roll_gap_window(&mut self) {
+    /// Called once a second: the buffer floor follows the worst gap of the last `secs` seconds.
+    fn roll_gap_window(&mut self, secs: usize) {
         self.gap_hist.push_back(self.gap_now_us);
-        if self.gap_hist.len() > 5 {
+        if self.gap_hist.len() > secs.max(1) {
             self.gap_hist.pop_front();
         }
         self.gap_now_us = 0;
@@ -436,6 +450,7 @@ impl Session {
             s.lost = r.concealed;
             s.underruns = r.underruns;
             s.fec = self.fec_depth as usize;
+            s.jitter_ms = self.stats.arrival_gap_us.load(Relaxed) as f32 / 1000.0;
         });
     }
 }

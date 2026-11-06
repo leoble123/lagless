@@ -48,6 +48,10 @@ pub struct Options {
     pub device: Option<String>,
     /// Debug: drop this percentage of outgoing datagrams.
     pub sim_loss: f64,
+    /// Also send every packet over the second-best link (first copy to arrive wins).
+    pub multipath: bool,
+    /// Windows: run the audio engine at its minimum period while capturing (see boost.rs).
+    pub engine_boost: bool,
     pub tone_rate: u32,
 }
 
@@ -198,9 +202,49 @@ impl Router {
             self.current = self.fixed; // send even if pings are firewalled
         }
     }
+
+    /// The best working path on a *different* link than the current one (e.g. Wi-Fi when the
+    /// cable is current). Sending on both means a hiccup on one link costs nothing.
+    fn backup(&self) -> Option<SocketAddr> {
+        let cur = self.current?;
+        self.paths
+            .iter()
+            .filter(|(a, _)| a.ip() != cur.ip())
+            .filter_map(|(a, p)| p.score().map(|s| (*a, s)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(a, _)| a)
+    }
+}
+
+/// A frame size that divides the OS capture chunk evenly, so no partial frame is left waiting
+/// for the next chunk. Picks the divisor of `chunk` closest to `want`, never above `max`.
+fn aligned_frame(chunk: usize, want: usize, max: usize) -> usize {
+    if chunk < 16 {
+        return want;
+    }
+    (16..=chunk.min(want * 2).min(max))
+        .filter(|d| chunk % d == 0)
+        .min_by_key(|d| ((*d as i64 - want as i64).abs(), -(*d as i64)))
+        .unwrap_or(want)
 }
 
 pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
+    crate::boost::process();
+    crate::boost::thread();
+    // Speed up the Windows audio engine *before* capture opens, so loopback starts in small chunks.
+    let _engine = if o.source == Source::Loopback && o.engine_boost {
+        crate::boost::low_latency_engine(o.device.clone())
+    } else {
+        None
+    };
+    if let Some((_, p)) = &_engine {
+        let (from, to) = (crate::boost::EnginePeriod::ms(p.default_frames, p.rate), crate::boost::EnginePeriod::ms(p.active_frames, p.rate));
+        sh.event(format!("Windows audio engine sped up: {from:.1} → {to:.1} ms"));
+        sh.update(|s| {
+            s.engine_ms = to;
+            s.engine_default_ms = from;
+        });
+    }
     let mut cap = open_capture(&o)?;
     let my_name = net::hostname();
     let wire_ch = cap.channels.min(2);
@@ -258,7 +302,11 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
         std::thread::park_timeout(Duration::from_millis(1));
 
         // --- audio out ---
-        let fs = enc.frame_samples(rate, wire_ch, o.frame_ms);
+        let mut fs = enc.frame_samples(rate, wire_ch, o.frame_ms);
+        if enc.codec() != Codec::Opus {
+            let max = enc.frame_samples(rate, wire_ch, 1000.0); // largest that fits a datagram
+            fs = aligned_frame(cap.chunk.load(Relaxed) as usize, fs, max);
+        }
         while cap.cons.slots() >= fs * cap.channels {
             let chunk = cap.cons.read_chunk(fs * cap.channels).unwrap();
             let (a, b) = chunk.as_slices();
@@ -288,6 +336,9 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
             if let Some(dst) = router.current {
                 let h = AudioHeader { stream_id, codec: enc.codec(), channels: wire_ch as u8, sample_rate: rate };
                 send_frames(&sock, dst, &h, &history, &mut pkt, o.sim_loss);
+                if let Some(b) = router.backup().filter(|_| o.multipath) {
+                    send_frames(&sock, b, &h, &history, &mut pkt, o.sim_loss);
+                }
             }
         }
 
@@ -450,4 +501,20 @@ fn publish(sh: &Shared, router: &Router, enc: &Encoder, rate: u32, cap: &Capture
             s.underruns = r.underruns;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aligned_frame;
+
+    #[test]
+    fn frames_divide_capture_chunks() {
+        assert_eq!(aligned_frame(480, 48, 229), 48); // 10 ms WASAPI @ 48k: 1 ms frames
+        assert_eq!(aligned_frame(128, 48, 229), 64); // 2.67 ms engine: 2 frames, nothing left over
+        assert_eq!(aligned_frame(441, 44, 229), 49); // 44.1k
+        assert_eq!(aligned_frame(0, 48, 229), 48); // unknown yet
+        assert_eq!(aligned_frame(48, 48, 229), 48); // tone source
+        assert_eq!(aligned_frame(1920, 192, 229), 192); // 192k: stays within one datagram
+        assert!(aligned_frame(512, 192, 229) <= 229);
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "lagless"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Ultra-low-latency PC-to-Mac audio streaming over Wi-Fi, Ethernet, USB or Bluetooth"
 
@@ -31,3 +31,20 @@ strip = true
 
 [build-dependencies]
 winresource = "0.1.34"
+
+[target.'cfg(windows)'.dependencies]
+# Same version cpal already builds, so this adds no compile time.
+windows = { version = "0.54", features = [
+    "Win32_Foundation",
+    "Win32_Media",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Security",
+] }

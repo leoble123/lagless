@@ -6,6 +6,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod audio;
+mod boost;
 mod codec;
 mod engine;
 mod gui;
@@ -57,6 +58,12 @@ enum Cmd {
         device: Option<String>,
         #[arg(long, default_value_t = 0.0, hide = true)]
         sim_loss: f64,
+        /// Don't duplicate packets over a second link
+        #[arg(long)]
+        no_multipath: bool,
+        /// Don't speed up the Windows audio engine
+        #[arg(long)]
+        no_engine_boost: bool,
         /// Sample rate for --source tone
         #[arg(long, default_value_t = 48000, hide = true)]
         tone_rate: u32,
@@ -74,14 +81,17 @@ enum Cmd {
         /// Never let the jitter buffer grow beyond this, in ms
         #[arg(long, default_value_t = 120.0)]
         max_latency: f64,
-        /// Audio device buffer in frames (64 ≈ 1.3 ms at 48k). 0 = system default
-        #[arg(long, default_value_t = 64)]
+        /// Audio device buffer in frames (32 ≈ 0.7 ms at 48k). 0 = system default
+        #[arg(long, default_value_t = 32)]
         buffer: u32,
         /// Name shown to senders (default: this computer's name)
         #[arg(long)]
         name: Option<String>,
         #[arg(long, hide = true)]
         null_output: bool,
+        /// Lowest latency: forget packet-gap spikes after 4 s instead of 20 s (may glitch more)
+        #[arg(long)]
+        lowest: bool,
     },
     /// List audio devices
     Devices,
@@ -121,12 +131,15 @@ fn run() -> Result<()> {
     let sh = engine::Shared::new();
     let worker = sh.clone();
     let job: Box<dyn FnOnce() -> Result<()> + Send> = match cmd {
-        Cmd::Send { to, port, name, codec, frame_ms, fec, bitrate, source, device, sim_loss, tone_rate } => {
-            let o = sender::Options { to, port, name, codec, frame_ms, redundancy: fec.min(8), bitrate_kbps: bitrate, source, device, sim_loss, tone_rate };
+        Cmd::Send { to, port, name, codec, frame_ms, fec, bitrate, source, device, sim_loss, tone_rate, no_multipath, no_engine_boost } => {
+            let o = sender::Options {
+                to, port, name, codec, frame_ms, redundancy: fec.min(8), bitrate_kbps: bitrate, source, device, sim_loss, tone_rate,
+                multipath: !no_multipath, engine_boost: !no_engine_boost,
+            };
             Box::new(move || sender::run(o, worker))
         }
-        Cmd::Receive { port, device, min_latency, max_latency, buffer, name, null_output } => {
-            let o = receiver::Options { port, device, min_latency_ms: min_latency, max_latency_ms: max_latency, buffer_frames: buffer, name, null_output };
+        Cmd::Receive { port, device, min_latency, max_latency, buffer, name, null_output, lowest } => {
+            let o = receiver::Options { port, device, min_latency_ms: min_latency, max_latency_ms: max_latency, buffer_frames: buffer, name, null_output, spike_memory_secs: if lowest { 4 } else { 20 } };
             Box::new(move || receiver::run(o, worker))
         }
         Cmd::Devices => return audio::list_devices(),
@@ -155,7 +168,7 @@ fn print_status(s: &engine::Status) {
         engine::Phase::Starting | engine::Phase::Searching => "searching…".to_string(),
         engine::Phase::Error(e) => format!("error: {e}"),
         phase => format!(
-            "{} {} via {} | {} {} kHz | rtt {:.2} ms | loss {:.1}% | buffer {:.1}/{:.1} ms | fixed {} lost {} rebuffers {} | ≈{:.0} ms",
+            "{} {} via {} | {} {} kHz | rtt {:.2} ms | loss {:.1}% | buffer {:.1}/{:.1} ms | jitter {:.1} ms | fixed {} lost {} rebuffers {} | ≈{:.0} ms",
             if *phase == engine::Phase::Streaming { "▶" } else { "‖" },
             s.peer_name,
             s.link_name,
@@ -165,6 +178,7 @@ fn print_status(s: &engine::Status) {
             s.loss_pct,
             s.buffer_ms,
             s.target_ms,
+            s.jitter_ms,
             s.fixed,
             s.lost,
             s.underruns,

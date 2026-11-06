@@ -13,6 +13,9 @@ pub const MAGIC_PING: &[u8; 4] = b"LGLP";
 pub const MAGIC_PONG: &[u8; 4] = b"LGLQ";
 pub const MAGIC_REPORT: &[u8; 4] = b"LGLR";
 pub const MAGIC_INFO: &[u8; 4] = b"LGLI";
+/// Sender -> broadcast on the receiver ports: "any receivers here?" Receivers answer with a
+/// unicast beacon, which firewalls let through as a reply even on "Public" networks.
+pub const MAGIC_PROBE: &[u8; 4] = b"LGLD";
 
 /// Frame flag: first frame after the capture source went quiet (not a network glitch).
 pub const FLAG_DISCONT: u8 = 1;
