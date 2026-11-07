@@ -1,6 +1,7 @@
 //! Desktop app: one window for both ends. Lightweight immediate-mode UI (egui), no web engine.
 //! Deliberately quiet: nothing animates while streaming, so it never pulls focus.
 
+use crate::control::{self, Control};
 use crate::engine::{Phase, Shared, Status};
 use crate::playout::Volume;
 use crate::sender::{CodecChoice, Source};
@@ -337,6 +338,10 @@ pub struct App {
     /// Volume to restore when unmuting via the speaker icon.
     unmute_to: f32,
     toast: Option<(String, f64)>,
+    /// Local control API for other apps on this computer (see control.rs).
+    control: Option<Arc<Control>>,
+    /// Streaming stopped from another app; the window shows a Resume button.
+    paused: bool,
 }
 
 impl App {
@@ -348,7 +353,11 @@ impl App {
             Ok(m) => (m, None),
             Err(e) => (None, Some(e)),
         };
+        let wake = cc.egui_ctx.clone();
+        let control = Control::start(settings_path().and_then(|p| p.parent().map(|d| d.to_path_buf())), move || wake.request_repaint());
         App {
+            control,
+            paused: false,
             draft: settings.clone(),
             updater: Updater::start(settings.auto_update),
             unmute_to: if settings.volume > 0.0 { settings.volume } else { 0.5 },
@@ -367,6 +376,7 @@ impl App {
 
     fn restart(&mut self, ctx: &egui::Context) {
         self.settings.save();
+        self.paused = false;
         self.engine.stop();
         self.engine = Engine::start(&self.settings, ctx.clone());
         self.restart_mic(ctx);
@@ -402,9 +412,78 @@ impl App {
             self.shown_latency = (self.status.latency_ms, now);
         }
     }
+
+    /// Apply a command from another app, the same way the matching control in the window would.
+    fn apply_command(&mut self, cmd: control::Command, ctx: &egui::Context) {
+        match cmd {
+            control::Command::Volume(v) => {
+                self.settings.volume = v;
+                self.apply_volume(true);
+            }
+            control::Command::Mute(mute) => {
+                let muted = self.settings.volume <= 0.0;
+                if mute && !muted {
+                    self.unmute_to = self.settings.volume;
+                    self.settings.volume = 0.0;
+                } else if !mute && muted {
+                    self.settings.volume = self.unmute_to;
+                }
+                self.apply_volume(true);
+            }
+            control::Command::Mic(on) => {
+                match self.settings.mode {
+                    Mode::Receive => self.settings.mic_send = on,
+                    Mode::Send => self.settings.mic_receive = on,
+                }
+                self.draft.mic_send = self.settings.mic_send;
+                self.draft.mic_receive = self.settings.mic_receive;
+                self.restart_mic(ctx);
+            }
+            control::Command::Pause(pause) => self.set_paused(pause, ctx),
+        }
+    }
+
+    fn set_paused(&mut self, pause: bool, ctx: &egui::Context) {
+        if pause == self.paused {
+            return;
+        }
+        self.paused = pause;
+        if pause {
+            self.engine.stop();
+            self.status = Status::default();
+        } else {
+            self.engine = Engine::start(&self.settings, ctx.clone());
+        }
+    }
+
+    fn control_state(&self) -> control::AppState {
+        control::AppState {
+            mode: match self.settings.mode {
+                Mode::Send => "send",
+                Mode::Receive => "receive",
+            },
+            paused: self.paused,
+            volume: self.settings.volume,
+            mic_enabled: match self.settings.mode {
+                Mode::Send => self.settings.mic_receive,
+                Mode::Receive => self.settings.mic_send,
+            },
+            mic_problem: self.mic_problem.clone(),
+        }
+    }
 }
 
 impl eframe::App for App {
+    /// Runs before every frame and also while the window is minimized/hidden (when the control
+    /// API wakes it), so other apps' commands apply even if nobody is looking at the window.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let Some(control) = self.control.clone() else { return };
+        for cmd in control.take_commands() {
+            self.apply_command(cmd, ctx);
+        }
+        control.publish(self.control_state(), &self.engine.shared, self.mic.as_ref().map(|m| &m.shared));
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
@@ -419,6 +498,14 @@ impl eframe::App for App {
                     egui::ScrollArea::vertical().max_height(ui.available_height() - 36.0).show(ui, |ui| self.settings_card(ui, &ctx));
                 } else {
                     self.status_block(ui);
+                    if self.paused {
+                        ui.vertical_centered(|ui| {
+                            if accent_button(ui, "Resume streaming").clicked() {
+                                self.set_paused(false, &ctx);
+                            }
+                        });
+                        ui.add_space(10.0);
+                    }
                     self.volume_row(ui);
                     ui.add_space(14.0);
                     self.mic_row(ui, &ctx);
@@ -433,6 +520,9 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(c) = &self.control {
+            c.shutdown();
+        }
         self.mic = None;
         self.engine.stop();
         // Quitting with an update downloaded installs it, so the next launch is the new version.
@@ -495,6 +585,7 @@ impl App {
 
         let peer = if st.peer_name.is_empty() { None } else { Some(st.peer_name.as_str()) };
         let (dot, line) = match (&st.phase, peer) {
+            _ if self.paused => (DIM, "Paused from another app".to_string()),
             (Phase::Streaming, Some(n)) => {
                 let fmt = match st.codec.as_str() {
                     "pcm24" => format!("24-bit/{} kHz", fmt_khz(st.sample_rate)),

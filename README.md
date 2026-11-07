@@ -44,6 +44,22 @@ lagless can also send your Mac's microphone (for example the iMac's built-in mic
 
 The mic travels uncompressed with the same 1 ms frames and loss protection as the speaker stream, on its own port (UDP 47802), so the two directions don't affect each other. Keep **CABLE Input** from being your PC's default speaker; lagless refuses to start the mic link if it is, because the mic would loop back to the Mac. To avoid echo in calls, use headphones or IEMs on the Mac, or leave your call app's echo cancellation on.
 
+## Control from other apps
+
+The desktop app runs a small control API so other apps on the same computer (like the Nova launcher) can show its status and drive it. It listens on `127.0.0.1` only, on a random port, and every request needs a secret token. Both are written to `control.json` next to `settings.json` (`%APPDATA%\Lagless` on Windows, `~/Library/Application Support/Lagless` on the Mac) while the app is open, and the file is removed when it quits. Requests that come from a web page (an `Origin` header, or a non-loopback `Host`) are refused.
+
+Send `Authorization: Bearer <token>` with each request:
+
+| Request | Body | Does |
+|---|---|---|
+| `GET /v1/status` | | Live status: phase, latency, link, format, peer, volume, mute, mic |
+| `POST /v1/volume` | `{"volume": 0.0–1.0}` | Same as the volume slider |
+| `POST /v1/mute` | `{"muted": true}` | Same as the speaker icon |
+| `POST /v1/mic` | `{"on": true}` | "Use Mac mic" on the PC, "Send mic to PC" on the Mac |
+| `POST /v1/pause` | `{"paused": true}` | Stop or resume streaming without quitting; the window shows a Resume button |
+
+Commands apply even while the window is minimized.
+
 ## Auto-update
 
 Every 6 hours the app checks this repo's latest GitHub Release. If there's a newer one, it downloads it in the background and verifies its SHA-256 checksum against the one published with the release. Then an **Update to x.y.z** button appears. Click it to restart into the new version, or just quit: the update installs on exit, so the next launch is the new version. You can turn this off in settings, and `lagless update` does it from a terminal.

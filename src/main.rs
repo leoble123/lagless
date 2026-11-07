@@ -8,6 +8,7 @@
 mod audio;
 mod boost;
 mod codec;
+mod control;
 mod engine;
 mod gui;
 mod mic_access;
