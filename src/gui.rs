@@ -577,7 +577,9 @@ impl App {
                     (Phase::Error(e), _) => ("problem".to_string(), BAD, e.as_str()),
                     (Phase::Streaming, _) if mode == Mode::Send => ("on · CABLE Output".to_string(), DIM, "Choose \"CABLE Output\" as the microphone in Discord, Zoom, OBS…"),
                     (Phase::Streaming, _) => (format!("on · {:.0} ms", ms.latency_ms), DIM, "Use headphones on the Mac (or your call app's echo cancellation) to avoid echo."),
-                    (Phase::Idle, _) => ("no mic audio".to_string(), DIM, ""),
+                    // Mic works but nothing comes back from the PC: the problem is on that side.
+                    (Phase::Idle, _) if mode == Mode::Receive && ms.capturing => ("PC isn't playing it".to_string(), OK, "The Mac mic is working and sending. On the PC: open lagless, check \"Use Mac mic\" is on and VB-Cable is installed; over a direct cable, use Settings → Allow lagless on all networks."),
+                    (Phase::Idle, _) => ("no mic input".to_string(), OK, ""),
                     _ => ("connecting…".to_string(), DIM, ""),
                 };
                 let l = ui.label(RichText::new(text).size(11.5).color(col));
@@ -586,6 +588,16 @@ impl App {
                 }
             });
         });
+        let mic_error = match &ms.phase {
+            Phase::Error(e) if self.mic.is_some() => Some(e.clone()),
+            _ => None,
+        };
+        if let Some(e) = mic_error {
+            ui.label(RichText::new(e).size(11.5).color(OK));
+            if cfg!(target_os = "macos") && ui.link(RichText::new("Open Microphone settings").size(11.5)).clicked() {
+                crate::mic_access::open_settings();
+            }
+        }
         if needs_cable {
             ui.horizontal(|ui| {
                 ui.add_space(44.0);

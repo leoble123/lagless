@@ -10,6 +10,7 @@ mod boost;
 mod codec;
 mod engine;
 mod gui;
+mod mic_access;
 mod net;
 mod playout;
 mod protocol;

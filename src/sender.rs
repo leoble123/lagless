@@ -290,6 +290,7 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
     let mut pkt = Vec::with_capacity(MAX_PACKET);
     let mut rbuf = [0u8; 256];
     let mut last_capture = Instant::now();
+    let started = Instant::now();
     let mut last_ping = Instant::now() - Duration::from_secs(1);
     let mut last_status = Instant::now();
     let mut last_report: Option<Report> = None;
@@ -405,6 +406,13 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
         if last_status.elapsed() >= Duration::from_millis(250) {
             last_status = Instant::now();
             publish(&sh, &router, &enc, rate, &cap, fs, loss_pct, last_report.as_ref(), redundancy, last_capture);
+            // A device that never delivers a single buffer is almost always a permission problem
+            // (macOS gives a denied app silence-by-absence, no error). Say so instead of "idle".
+            let never = cap.chunk.load(Relaxed) == 0;
+            if o.source == Source::Input && never && started.elapsed() > Duration::from_secs(2) {
+                let msg = crate::mic_access::silent_mic_message();
+                sh.update(|s| s.phase = Phase::Error(msg));
+            }
         }
     }
     Ok(())
@@ -470,16 +478,20 @@ fn downmix(input: &[f32], ch: usize, out: &mut Vec<f32>) {
 
 #[allow(clippy::too_many_arguments)]
 fn publish(sh: &Shared, router: &Router, enc: &Encoder, rate: u32, cap: &Capture, fs: usize, loss: f64, r: Option<&Report>, redundancy: usize, last_capture: Instant) {
+    let flowing = last_capture.elapsed() < Duration::from_millis(500);
     let Some(cur) = router.current else {
-        sh.update(|s| s.phase = Phase::Searching);
+        sh.update(|s| {
+            s.phase = Phase::Searching;
+            s.capturing = flowing;
+        });
         return;
     };
     let rtt = router.paths.get(&cur).and_then(Path::score).unwrap_or(0.0) as f32;
     let capture_ms = cap.chunk.load(Relaxed) as f32 * 1000.0 / cap.rate as f32;
     let frame_ms = fs as f32 * 1000.0 / rate as f32;
     let route = net::route_name(cur.ip());
-    let flowing = last_capture.elapsed() < Duration::from_millis(500);
     sh.update(|s| {
+        s.capturing = flowing;
         s.phase = if flowing && r.is_some() { Phase::Streaming } else { Phase::Idle };
         s.peer_name = router.receiver.as_ref().map(|r| r.1.clone()).unwrap_or_else(|| cur.ip().to_string());
         s.peer_addr = cur.ip().to_string();

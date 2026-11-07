@@ -94,6 +94,8 @@ pub struct Status {
     pub fec: usize,
     /// Windows audio engine period with the low-latency trick active, and what it was (ms).
     pub engine_ms: f32,
+    /// Sender: audio is coming in from the capture device.
+    pub capturing: bool,
     /// Receiver: worst gap between packets over the last few seconds (what the buffer must cover).
     pub jitter_ms: f32,
     pub engine_default_ms: f32,
@@ -123,6 +125,7 @@ impl Default for Status {
             fec: 0,
             engine_ms: 0.0,
             jitter_ms: 0.0,
+            capturing: false,
             engine_default_ms: 0.0,
         }
     }
