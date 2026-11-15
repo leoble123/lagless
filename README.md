@@ -42,6 +42,14 @@ lagless can also send your Mac's microphone (for example the iMac's built-in mic
 2. **On the Mac:** turn on **Send this Mac's mic to the PC** and allow microphone access when macOS asks. Pick a different mic in settings if you like.
 3. **In your PC app:** choose **CABLE Output** as the microphone.
 
+**Voice focus** (on by default; in settings under Microphone) cleans the mic up before it's sent:
+- a **90 Hz high-pass** removes hum, fan rumble and desk bumps;
+- **RNNoise**, a small neural network trained to separate speech from noise, removes keyboards, fans, AC and room noise (about 24 dB less steady background in tests);
+- a **voice leveler** brings quiet speech up to a steady level (up to +18 dB). It only adjusts while you're talking, so background is never turned up;
+- a gentle **gate** between phrases and a **soft limiter** so shouts don't clip.
+
+It sends the mic as mono at 48 kHz and adds about 20 ms to the mic path only; the PC→Mac audio is unaffected. Turn it off for the lowest possible mic latency.
+
 The mic travels uncompressed with the same 1 ms frames and loss protection as the speaker stream, on its own port (UDP 47802), so the two directions don't affect each other. Keep **CABLE Input** from being your PC's default speaker; lagless refuses to start the mic link if it is, because the mic would loop back to the Mac. To avoid echo in calls, use headphones or IEMs on the Mac, or leave your call app's echo cancellation on.
 
 ## Control from other apps

@@ -75,6 +75,8 @@ pub struct Settings {
     /// (0) so files written before it existed get migrated.
     #[serde(default)]
     pub tuning: u32,
+    /// Mac mic: noise suppression + voice leveling before sending.
+    pub voice_focus: bool,
     /// Volume slider position, 0..1 (see `Volume::slider_to_gain`).
     pub volume: f32,
     pub auto_update: bool,
@@ -101,6 +103,7 @@ impl Default for Settings {
             multipath: true,
             engine_boost: true,
             tuning: 1,
+            voice_focus: true,
             volume: 1.0,
             auto_update: true,
         }
@@ -210,6 +213,7 @@ impl Engine {
                         tone_rate: 48000,
                         multipath: s.multipath,
                         engine_boost: s.engine_boost,
+                        voice_focus: false,
                     },
                     sh,
                 )
@@ -239,6 +243,7 @@ impl Engine {
                         tone_rate: 48000,
                         multipath: s.multipath,
                         engine_boost: false,
+                        voice_focus: s.voice_focus,
                     },
                     sh,
                 )
@@ -772,6 +777,8 @@ impl App {
                             ui.selectable_value(&mut d.mic_device, Some(n.clone()), n);
                         }
                     });
+                    ui.checkbox(&mut d.voice_focus, "Voice focus");
+                    hint(ui, "Keeps voices, removes background noise (keyboard, fans, room) and evens out your level. Adds about 20 ms to the mic only.");
                     section(ui, "NAME ON THE NETWORK");
                     ui.add(egui::TextEdit::singleline(&mut d.rx_name).hint_text(crate::net::hostname()).desired_width(f32::INFINITY));
                 }

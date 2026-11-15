@@ -18,6 +18,7 @@ mod protocol;
 mod receiver;
 mod sender;
 mod update;
+mod voice;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -66,6 +67,9 @@ enum Cmd {
         /// Don't speed up the Windows audio engine
         #[arg(long)]
         no_engine_boost: bool,
+        /// Noise suppression + leveling for a microphone source (adds ~20 ms)
+        #[arg(long)]
+        voice_focus: bool,
         /// Sample rate for --source tone
         #[arg(long, default_value_t = 48000, hide = true)]
         tone_rate: u32,
@@ -133,10 +137,10 @@ fn run() -> Result<()> {
     let sh = engine::Shared::new();
     let worker = sh.clone();
     let job: Box<dyn FnOnce() -> Result<()> + Send> = match cmd {
-        Cmd::Send { to, port, name, codec, frame_ms, fec, bitrate, source, device, sim_loss, tone_rate, no_multipath, no_engine_boost } => {
+        Cmd::Send { to, port, name, codec, frame_ms, fec, bitrate, source, device, sim_loss, tone_rate, no_multipath, no_engine_boost, voice_focus } => {
             let o = sender::Options {
                 to, port, name, codec, frame_ms, redundancy: fec.min(8), bitrate_kbps: bitrate, source, device, sim_loss, tone_rate,
-                multipath: !no_multipath, engine_boost: !no_engine_boost,
+                multipath: !no_multipath, engine_boost: !no_engine_boost, voice_focus,
             };
             Box::new(move || sender::run(o, worker))
         }

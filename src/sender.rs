@@ -52,6 +52,8 @@ pub struct Options {
     pub multipath: bool,
     /// Windows: run the audio engine at its minimum period while capturing (see boost.rs).
     pub engine_boost: bool,
+    /// Mic link: mono, noise-suppressed, leveled speech (see voice.rs).
+    pub voice_focus: bool,
     pub tone_rate: u32,
 }
 
@@ -96,7 +98,20 @@ fn open_capture(o: &Options) -> Result<Capture> {
 
     let loopback = o.source == Source::Loopback;
     let device = audio::find_device(o.device.as_deref(), loopback)?;
-    let cfg = if loopback { device.default_output_config()? } else { device.default_input_config()? };
+    let cfg = if loopback {
+        device.default_output_config()?
+    } else {
+        let def = device.default_input_config()?;
+        // Voice focus runs at 48 kHz; most mics offer it even when their default is 44.1k.
+        let at_48k = (o.voice_focus && def.sample_rate().0 != 48_000)
+            .then(|| device.supported_input_configs().ok())
+            .flatten()
+            .and_then(|mut cs| {
+                cs.find(|c| c.channels() == def.channels() && c.sample_format() == def.sample_format() && (c.min_sample_rate().0..=c.max_sample_rate().0).contains(&48_000))
+            })
+            .map(|c| c.with_sample_rate(cpal::SampleRate(48_000)));
+        at_48k.unwrap_or(def)
+    };
     let (rate, channels) = (cfg.sample_rate().0, cfg.channels() as usize);
     let (mut prod, cons) = RingBuffer::new(rate as usize * channels);
     let ch = chunk.clone();
@@ -247,7 +262,13 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
     }
     let mut cap = open_capture(&o)?;
     let my_name = net::hostname();
-    let wire_ch = cap.channels.min(2);
+    let wants_voice = o.voice_focus && o.source == Source::Input;
+    let mut voice = if wants_voice { crate::voice::VoiceFocus::new(cap.rate) } else { None };
+    if wants_voice && voice.is_none() {
+        sh.event(format!("Voice focus needs 48 kHz; this mic runs at {} Hz, so it's off", cap.rate));
+    }
+    // Voice focus works on one channel: a mic is mono anyway, and it halves the bandwidth.
+    let wire_ch = if voice.is_some() { 1 } else { cap.channels.min(2) };
     let rate = cap.rate;
     let stream_id = net::random_u64() as u32;
 
@@ -315,7 +336,12 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
             frame.extend_from_slice(a);
             frame.extend_from_slice(b);
             chunk.commit_all();
-            downmix(&frame, cap.channels, &mut wire);
+            if let Some(v) = voice.as_mut() {
+                to_mono(&frame, cap.channels, &mut wire);
+                v.process(&mut wire);
+            } else {
+                downmix(&frame, cap.channels, &mut wire);
+            }
             let g = sh.volume.get();
             if g < 0.9999 {
                 wire.iter_mut().for_each(|s| *s *= g);
@@ -395,7 +421,7 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
             let rtt = router.paths.get(&dst).and_then(Path::score).unwrap_or(0.0);
             let info = Info {
                 stream_id,
-                sender_us: ((cap.chunk.load(Relaxed) as f64 / cap.rate as f64 + fs as f64 / rate as f64) * 1e6) as u32,
+                sender_us: ((cap.chunk.load(Relaxed) as f64 / cap.rate as f64 + fs as f64 / rate as f64 + if voice.is_some() { crate::voice::DELAY_SECS } else { 0.0 }) * 1e6) as u32,
                 rtt_us: (rtt * 1000.0) as u32,
                 link: LinkKind::classify(&net::route_name(dst.ip()), dst.ip()).to_u8(),
                 name: my_name.clone(),
@@ -457,6 +483,12 @@ fn adapt(enc: &mut Encoder, redundancy: &mut usize, o: &Options, rate: u32, ch: 
         sh.event("Link is clean again — back to lossless 24-bit");
     }
     Ok(())
+}
+
+fn to_mono(input: &[f32], ch: usize, out: &mut Vec<f32>) {
+    out.clear();
+    let use_ch = ch.clamp(1, 2);
+    out.extend(input.chunks_exact(ch).map(|f| f[..use_ch].iter().sum::<f32>() / use_ch as f32));
 }
 
 /// Wire format is mono or stereo. Surround layouts fold centre and surrounds into L/R.
