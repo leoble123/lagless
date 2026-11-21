@@ -548,6 +548,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))] // the Windows build has no sound model
     fn silence_raises_nothing() {
         let mut d = Detector::new(Arc::new(Model::bundled()), 48_000, Category::ALL.to_vec(), 1.0);
         assert!(d.push(&vec![0.0; 48_000 * 3]).is_empty());
@@ -557,6 +558,7 @@ mod tests {
     /// rate. Files are named "<category>__<anything>.wav". Set LAGLESS_SOUND_CLIPS.
     #[test]
     #[ignore]
+    #[cfg(not(windows))]
     fn real_recordings() {
         let dir = std::env::var("LAGLESS_SOUND_CLIPS").expect("set LAGLESS_SOUND_CLIPS");
         let model = Arc::new(Model::bundled());

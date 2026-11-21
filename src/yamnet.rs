@@ -331,6 +331,7 @@ mod tests {
     /// Set LAGLESS_YAMNET_REF to a folder of <clip>.pcm (16 kHz f32), .mel and .scores files.
     #[test]
     #[ignore]
+    #[cfg(not(windows))]
     fn matches_tensorflow() {
         let dir = std::env::var("LAGLESS_YAMNET_REF").expect("set LAGLESS_YAMNET_REF");
         let model = Model::bundled();
