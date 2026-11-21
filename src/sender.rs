@@ -319,6 +319,7 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
     let mut good_secs = 0u32;
     let mut loss_pct = 0.0;
     let mut last_info = Instant::now();
+    let mut seen_alerts: VecDeque<u32> = VecDeque::new();
 
     while !sh.stopped() {
         std::thread::park_timeout(Duration::from_millis(1));
@@ -382,6 +383,14 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
                             p.rtts.pop_front();
                         }
                         p.last_pong = Some(Instant::now());
+                    } else if let Some((id, text)) = protocol::parse_alert(b) {
+                        if !seen_alerts.contains(&id) {
+                            seen_alerts.push_back(id);
+                            if seen_alerts.len() > 32 {
+                                seen_alerts.pop_front();
+                            }
+                            sh.alert_arrived(text);
+                        }
                     } else if let Some(r) = protocol::parse_report(b) {
                         if r.stream_id != stream_id {
                             continue;

@@ -6,6 +6,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod audio;
+mod aware;
 mod boost;
 mod codec;
 mod control;
@@ -19,6 +20,7 @@ mod receiver;
 mod sender;
 mod update;
 mod voice;
+mod yamnet;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -103,6 +105,18 @@ enum Cmd {
     Devices,
     /// Install the latest release now
     Update,
+    /// Listen for important sounds (doorbell, knock, alarm…) and print them; for checking sound alerts
+    Listen {
+        /// Microphone (part of its name); default = system default input
+        #[arg(long)]
+        device: Option<String>,
+        /// 0..1 (0.5 = default)
+        #[arg(long, default_value_t = 0.5)]
+        sensitivity: f32,
+        /// Analyse a 16-bit WAV file instead of the mic
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+    },
 }
 
 fn main() {
@@ -149,6 +163,29 @@ fn run() -> Result<()> {
             Box::new(move || receiver::run(o, worker))
         }
         Cmd::Devices => return audio::list_devices(),
+        Cmd::Listen { device, sensitivity, file } => {
+            anyhow::ensure!(yamnet::Model::available(), "sound alerts aren't included in the Windows build");
+            let cats = aware::Category::ALL.to_vec();
+            if let Some(f) = file {
+                let (rate, wave) = aware::read_wav(&f)?;
+                let mut d = aware::Detector::new(std::sync::Arc::new(yamnet::Model::bundled()), rate, cats, sensitivity);
+                for a in wave.chunks(1024).flat_map(|c| d.push(c)) {
+                    println!("{:6.2}s  {}  ({:.2})", a.at, a.text, a.score);
+                }
+                return Ok(());
+            }
+            println!("Listening… (Ctrl+C to stop)");
+            let l = aware::Listener::start(aware::ListenOptions { device, categories: cats, sensitivity, hear: false }, || {});
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if let Some(p) = l.problem() {
+                    anyhow::bail!(p);
+                }
+                for a in l.take_alerts() {
+                    println!("{:6.1}s  {}  ({:.2})", a.at, a.text, a.score);
+                }
+            }
+        }
         Cmd::Update => {
             match update::Updater::update_blocking()? {
                 Some(v) => println!("Updated to {v}. Restart lagless to use it."),

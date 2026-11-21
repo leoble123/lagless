@@ -120,6 +120,16 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
             Err(e) => return Err(e.into()),
         }
 
+        // Sound-awareness alerts for the PC: a few copies, since it's UDP and it matters.
+        for text in sh.take_outgoing_alerts() {
+            if let Some(s) = &session {
+                let pkt = protocol::write_alert(net::random_u64() as u32, &text);
+                for _ in 0..3 {
+                    let _ = sock.send_to(&pkt, s.sender);
+                }
+            }
+        }
+
         if last_tick.elapsed() >= Duration::from_millis(250) {
             last_tick = Instant::now();
             if session.as_ref().is_some_and(|s| s.last_packet.elapsed() > Duration::from_secs(10)) {
@@ -190,11 +200,14 @@ fn open_session(o: &Options, h: AudioHeader, sender: SocketAddr, sh: &Arc<Shared
         let mut playout = Playout::new(cons, ch, out_ch as usize, h.sample_rate, out_rate, o.min_latency_ms, o.max_latency_ms, stats.clone(), sh.volume.clone());
         let st = stats.clone();
         let sc = cpal::StreamConfig { channels: out_ch, sample_rate: cpal::SampleRate(out_rate), buffer_size: bs };
+        let vol = sh.volume.clone();
         let built = audio::build_output(&device, &sc, fmt, move |out, lat| {
             if let Some(l) = lat {
                 st.device_us.store((l * 1e6) as u32, Relaxed);
             }
             playout.process(out);
+            // Sound awareness: after an alert, duck the game and let the room in for a moment.
+            crate::aware::HEAR.mix(out, out_ch as usize, out_rate, (vol.get().max(0.2) * 2.0).min(2.0));
         });
         match built.and_then(|s| s.play().map(|_| s).map_err(|_| cpal::BuildStreamError::DeviceNotAvailable)) {
             Ok(stream) => {

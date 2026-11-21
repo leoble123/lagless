@@ -16,6 +16,9 @@ pub const MAGIC_INFO: &[u8; 4] = b"LGLI";
 /// Sender -> broadcast on the receiver ports: "any receivers here?" Receivers answer with a
 /// unicast beacon, which firewalls let through as a reply even on "Public" networks.
 pub const MAGIC_PROBE: &[u8; 4] = b"LGLD";
+/// Receiver -> sender: "heard something in the room" (sound awareness). Sent a few times;
+/// the id lets the sender show it once.
+pub const MAGIC_ALERT: &[u8; 4] = b"LGLE";
 
 /// Frame flag: first frame after the capture source went quiet (not a network glitch).
 pub const FLAG_DISCONT: u8 = 1;
@@ -243,6 +246,24 @@ pub fn parse_info(buf: &[u8]) -> Option<Info> {
     })
 }
 
+pub fn write_alert(id: u32, text: &str) -> Vec<u8> {
+    let t = &text.as_bytes()[..text.len().min(200)];
+    let mut v = Vec::with_capacity(9 + t.len());
+    v.extend_from_slice(MAGIC_ALERT);
+    v.extend_from_slice(&id.to_le_bytes());
+    v.push(t.len() as u8);
+    v.extend_from_slice(t);
+    v
+}
+
+pub fn parse_alert(buf: &[u8]) -> Option<(u32, String)> {
+    if buf.len() < 9 || &buf[0..4] != MAGIC_ALERT {
+        return None;
+    }
+    let t = buf.get(9..9 + buf[8] as usize)?;
+    Some((u32_at(buf, 4), String::from_utf8_lossy(t).into_owned()))
+}
+
 fn u32_at(b: &[u8], i: usize) -> u32 {
     u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
 }
@@ -285,6 +306,8 @@ mod tests {
         assert_eq!(parse_report(&write_report(&r)), Some(r));
         let i = Info { stream_id: 5, sender_us: 11_000, rtt_us: 300, link: 2, name: "PC".into() };
         assert_eq!(parse_info(&write_info(&i)), Some(i));
+        assert_eq!(parse_alert(&write_alert(9, "Doorbell")), Some((9, "Doorbell".into())));
+        assert_eq!(parse_alert(b"LGLE"), None);
     }
 
     #[test]

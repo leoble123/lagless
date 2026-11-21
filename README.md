@@ -68,6 +68,21 @@ Send `Authorization: Bearer <token>` with each request:
 
 Commands apply even while the window is minimized.
 
+## Sound alerts (hear the room with your IEMs in)
+
+With IEMs in, you can miss the doorbell, someone knocking or a smoke alarm. Turn on **Sound alerts** on the Mac and lagless listens to the room through the Mac's mic. When it hears something that matters:
+- **On the PC:** a small banner appears at the top of the screen, over the game. It can't be clicked and never takes focus, so it won't interrupt your input. It shows over games in borderless/windowed-fullscreen mode, which is the default for Fortnite and most games. It can't draw over *exclusive* fullscreen.
+- **In your ears:** the game ducks to about 25% for 6 seconds and the room sound is mixed in. Playback starts about 0.8 s *before* the detection, so you hear the knock itself rather than the silence after it.
+- **On the Mac:** a banner in the window and a regular notification.
+
+What it listens for: doorbell, knocking, alarms (smoke alarm and sirens called out specifically), phone ringing, dog barking, baby crying, someone shouting, and something breaking. Cat and "someone talking" are off by default; talking would trigger on your own voice chat. Each one can be turned on or off in settings, and there's a sensitivity slider.
+
+**How it works:** it's Google's open-source **YAMNet** sound model (trained on millions of labelled YouTube clips, 521 kinds of sound), running entirely on the Mac with lagless's own Rust code. It uses about 2% of one CPU core. Audio never leaves the Mac; only the alert's name goes to the PC. Alerts reach the PC while it's streaming to the Mac.
+
+**Tested on real recordings** from the public ESC-50 set: it caught 27 of 28 target sounds it had never seen. Typing, mouse clicks, coughing, laughing, clapping, church bells, car horns, rain, a vacuum and a washing machine caused no alerts. The usual false alarm is a **creaking door**, which the model sometimes hears as a dog or a knock.
+
+To check it from a terminal: `lagless listen` prints what it hears from the mic, or `lagless listen --file clip.wav` for a recording.
+
 ## Auto-update
 
 Every 6 hours the app checks this repo's latest GitHub Release. If there's a newer one, it downloads it in the background and verifies its SHA-256 checksum against the one published with the release. Then an **Update to x.y.z** button appears. Click it to restart into the new version, or just quit: the update installs on exit, so the next launch is the new version. You can turn this off in settings, and `lagless update` does it from a terminal.

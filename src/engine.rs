@@ -138,6 +138,11 @@ pub struct Shared {
     /// Peak levels since the UI last looked (max-accumulated by the engine, taken by the UI).
     levels: Mutex<[f32; 2]>,
     events: Mutex<VecDeque<String>>,
+    /// Receiver: alerts to send to the PC. Sender: alerts that arrived from the Mac.
+    alerts_out: Mutex<Vec<String>>,
+    alerts_in: Mutex<Vec<String>>,
+    /// Wakes the UI (set by the app), so an alert shows even while the window is in the background.
+    waker: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// Output (receiver) or stream (sender) volume, live from the UI.
     pub volume: Arc<crate::playout::Volume>,
 }
@@ -181,6 +186,33 @@ impl Shared {
         let mut l = self.levels.lock().unwrap();
         l[0] = l[0].max(pk[0]);
         l[1] = l[1].max(pk[1]);
+    }
+
+    pub fn set_waker(&self, f: impl Fn() + Send + 'static) {
+        *self.waker.lock().unwrap() = Some(Box::new(f));
+    }
+
+    pub fn wake(&self) {
+        if let Some(w) = &*self.waker.lock().unwrap() {
+            w();
+        }
+    }
+
+    pub fn send_alert(&self, text: impl Into<String>) {
+        self.alerts_out.lock().unwrap().push(text.into());
+    }
+
+    pub fn take_outgoing_alerts(&self) -> Vec<String> {
+        std::mem::take(&mut *self.alerts_out.lock().unwrap())
+    }
+
+    pub fn alert_arrived(&self, text: String) {
+        self.alerts_in.lock().unwrap().push(text);
+        self.wake();
+    }
+
+    pub fn take_alerts(&self) -> Vec<String> {
+        std::mem::take(&mut *self.alerts_in.lock().unwrap())
     }
 
     pub fn take_levels(&self) -> [f32; 2] {

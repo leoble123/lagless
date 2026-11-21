@@ -77,6 +77,17 @@ pub struct Settings {
     pub tuning: u32,
     /// Mac mic: noise suppression + voice leveling before sending.
     pub voice_focus: bool,
+    /// Sound awareness (Mac): listen to the room and flag important sounds.
+    pub aware: bool,
+    pub aware_categories: Vec<crate::aware::Category>,
+    /// 0..1, 0.5 = default thresholds.
+    pub aware_sensitivity: f32,
+    /// Duck the game and mix the room in for a few seconds after an alert.
+    pub aware_hear: bool,
+    /// Show the alert on the PC's screen (over the game).
+    pub aware_pc: bool,
+    /// Also post a macOS notification.
+    pub aware_notify: bool,
     /// Volume slider position, 0..1 (see `Volume::slider_to_gain`).
     pub volume: f32,
     pub auto_update: bool,
@@ -104,6 +115,12 @@ impl Default for Settings {
             engine_boost: true,
             tuning: 1,
             voice_focus: true,
+            aware: false,
+            aware_categories: crate::aware::Category::ALL.iter().copied().filter(|c| c.on_by_default()).collect(),
+            aware_sensitivity: 0.5,
+            aware_hear: true,
+            aware_pc: true,
+            aware_notify: true,
             volume: 1.0,
             auto_update: true,
         }
@@ -160,6 +177,8 @@ impl Engine {
     fn spawn(name: &str, job: Job, gain: f32, ctx: egui::Context) -> Self {
         let shared = Shared::new();
         shared.volume.set(gain); // before the first sample, so a low setting never blasts
+        let waker = ctx.clone();
+        shared.set_waker(move || waker.request_repaint());
         let sh = shared.clone();
         let handle = std::thread::Builder::new()
             .name(name.into())
@@ -347,6 +366,12 @@ pub struct App {
     control: Option<Arc<Control>>,
     /// Streaming stopped from another app; the window shows a Resume button.
     paused: bool,
+    /// Sound awareness listener (Mac, receive mode).
+    listener: Option<crate::aware::Listener>,
+    /// Latest room alert: (text, shown until). On the Mac it's a banner in the window; on the
+    /// PC it's an always-on-top overlay over whatever is fullscreen.
+    alert: Option<(String, f64)>,
+    fonts_warm: bool,
 }
 
 impl App {
@@ -360,9 +385,13 @@ impl App {
         };
         let wake = cc.egui_ctx.clone();
         let control = Control::start(settings_path().and_then(|p| p.parent().map(|d| d.to_path_buf())), move || wake.request_repaint());
+        let listener = start_listener(&settings, &cc.egui_ctx);
         App {
             control,
             paused: false,
+            listener,
+            alert: None,
+            fonts_warm: false,
             draft: settings.clone(),
             updater: Updater::start(settings.auto_update),
             unmute_to: if settings.volume > 0.0 { settings.volume } else { 0.5 },
@@ -385,6 +414,44 @@ impl App {
         self.engine.stop();
         self.engine = Engine::start(&self.settings, ctx.clone());
         self.restart_mic(ctx);
+        self.restart_listener(ctx);
+    }
+
+    fn restart_listener(&mut self, ctx: &egui::Context) {
+        self.settings.save();
+        self.listener = None; // Drop stops it
+        self.listener = start_listener(&self.settings, ctx);
+    }
+
+    /// Route room alerts: Mac (listener) -> banner, notification, PC; PC (network) -> overlay.
+    fn pump_alerts(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let mut fresh: Vec<String> = Vec::new();
+        if let Some(l) = &self.listener {
+            for a in l.take_alerts() {
+                if self.settings.aware_pc {
+                    self.engine.shared.send_alert(a.text.clone());
+                }
+                if self.settings.aware_notify {
+                    notify(&a.text);
+                }
+                fresh.push(a.text);
+            }
+        }
+        fresh.extend(self.engine.shared.take_alerts());
+        if let Some(text) = fresh.pop() {
+            self.alert = Some((text, now + ALERT_SECS));
+        }
+        if let Some((text, until)) = self.alert.clone() {
+            if now >= until {
+                self.alert = None;
+            } else {
+                if self.settings.mode == Mode::Send {
+                    alert_overlay(ctx, &text);
+                }
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+        }
     }
 
     fn restart_mic(&mut self, ctx: &egui::Context) {
@@ -482,6 +549,7 @@ impl eframe::App for App {
     /// Runs before every frame and also while the window is minimized/hidden (when the control
     /// API wakes it), so other apps' commands apply even if nobody is looking at the window.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.pump_alerts(ctx);
         let Some(control) = self.control.clone() else { return };
         for cmd in control.take_commands() {
             self.apply_command(cmd, ctx);
@@ -491,6 +559,10 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if !self.fonts_warm {
+            warm_fonts(&ctx);
+            self.fonts_warm = true;
+        }
         let now = ctx.input(|i| i.time);
         self.tick(now);
 
@@ -502,6 +574,9 @@ impl eframe::App for App {
                     ui.add_space(10.0);
                     egui::ScrollArea::vertical().max_height(ui.available_height() - 36.0).show(ui, |ui| self.settings_card(ui, &ctx));
                 } else {
+                    if let Some((text, _)) = &self.alert {
+                        alert_banner(ui, text);
+                    }
                     self.status_block(ui);
                     if self.paused {
                         ui.vertical_centered(|ui| {
@@ -514,6 +589,10 @@ impl eframe::App for App {
                     self.volume_row(ui);
                     ui.add_space(14.0);
                     self.mic_row(ui, &ctx);
+                    if self.settings.mode == Mode::Receive {
+                        ui.add_space(8.0);
+                        self.aware_row(ui, &ctx);
+                    }
                     ui.add_space(10.0);
                     egui::ScrollArea::vertical().max_height(ui.available_height() - 36.0).show(ui, |ui| self.details(ui));
                 }
@@ -528,6 +607,7 @@ impl eframe::App for App {
         if let Some(c) = &self.control {
             c.shutdown();
         }
+        self.listener = None;
         self.mic = None;
         self.engine.stop();
         // Quitting with an update downloaded installs it, so the next launch is the new version.
@@ -713,6 +793,36 @@ impl App {
         }
     }
 
+    fn aware_row(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        let mut toggled = false;
+        ui.horizontal(|ui| {
+            if toggle(ui, &mut self.settings.aware).clicked() {
+                toggled = true;
+            }
+            ui.label(RichText::new("Sound alerts").size(13.0).color(TEXT));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let (text, col) = match (&self.listener, self.settings.aware) {
+                    (_, false) => (String::new(), DIM),
+                    (Some(l), _) if l.problem().is_some() => ("problem".to_string(), BAD),
+                    _ if crate::aware::HEAR.active() => ("hearing the room…".to_string(), ACCENT),
+                    _ => ("listening".to_string(), DIM),
+                };
+                ui.label(RichText::new(text).size(11.5).color(col))
+                    .on_hover_text("Listens to the room through this Mac's mic and tells you about doorbells, knocks, alarms and more while your IEMs are in. Everything stays on this Mac.");
+            });
+        });
+        if let Some(p) = self.listener.as_ref().and_then(|l| l.problem()) {
+            ui.label(RichText::new(p).size(11.5).color(OK));
+            if cfg!(target_os = "macos") && ui.link(RichText::new("Open Microphone settings").size(11.5)).clicked() {
+                crate::mic_access::open_settings();
+            }
+        }
+        if toggled {
+            self.draft.aware = self.settings.aware;
+            self.restart_listener(ctx);
+        }
+    }
+
     fn details(&self, ui: &mut Ui) {
         let st = &self.status;
         egui::CollapsingHeader::new(RichText::new("Details").size(12.0).color(DIM)).id_salt("details").default_open(false).show(ui, |ui| {
@@ -824,6 +934,26 @@ impl App {
                     section(ui, "RECEIVER");
                     ui.add(egui::TextEdit::singleline(&mut d.to).hint_text("Automatic — or type the Mac's IP").desired_width(f32::INFINITY));
                 }
+            }
+            if d.mode == Mode::Receive {
+                section(ui, "SOUND ALERTS");
+                ui.checkbox(&mut d.aware, "Listen for important sounds in the room");
+                ui.horizontal_wrapped(|ui| {
+                    for cat in crate::aware::Category::ALL {
+                        let mut on = d.aware_categories.contains(&cat);
+                        if ui.checkbox(&mut on, cat.label()).changed() {
+                            d.aware_categories.retain(|c| *c != cat);
+                            if on {
+                                d.aware_categories.push(cat);
+                            }
+                        }
+                    }
+                });
+                ui.add(egui::Slider::new(&mut d.aware_sensitivity, 0.0..=1.0).show_value(false).text("sensitivity"));
+                ui.checkbox(&mut d.aware_hear, "Let me hear it (duck the game, mix the room in for a few seconds)");
+                ui.checkbox(&mut d.aware_pc, "Show it on the PC screen");
+                ui.checkbox(&mut d.aware_notify, "Mac notification");
+                hint(ui, "Runs Google's YAMNet sound model on this Mac (about 2% of one CPU core). Audio never leaves the Mac; only the alert text goes to the PC.");
             }
             section(ui, "LATENCY TWEAKS");
             if d.mode == Mode::Receive {
@@ -974,6 +1104,122 @@ fn segmented(ui: &mut Ui, mode: Mode) -> Option<Mode> {
         }
     });
     out
+}
+
+const ALERT_SECS: f64 = 6.0;
+
+fn start_listener(s: &Settings, ctx: &egui::Context) -> Option<crate::aware::Listener> {
+    if s.mode != Mode::Receive || !s.aware {
+        return None;
+    }
+    let wake = ctx.clone();
+    Some(crate::aware::Listener::start(
+        crate::aware::ListenOptions {
+            device: s.mic_device.clone(),
+            categories: s.aware_categories.clone(),
+            sensitivity: s.aware_sensitivity,
+            hear: s.aware_hear,
+        },
+        move || wake.request_repaint(),
+    ))
+}
+
+/// macOS notification for a room alert (in the background, never blocks the UI).
+fn notify(text: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let clean: String = text.chars().filter(|c| c.is_alphanumeric() || " -'".contains(*c)).collect();
+        let script = format!("display notification \"{clean}\" with title \"lagless\" subtitle \"Heard in the room\"");
+        let _ = std::process::Command::new("osascript").args(["-e", &script]).spawn();
+    }
+    let _ = text;
+}
+
+/// The banner shown inside the lagless window.
+fn alert_banner(ui: &mut Ui, text: &str) {
+    egui::Frame::new()
+        .fill(ACCENT.gamma_multiply(0.18))
+        .stroke(Stroke::new(1.0, ACCENT.gamma_multiply(0.6)))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                bell_icon(ui, ACCENT);
+                ui.label(RichText::new(text).size(15.0).color(TEXT).strong());
+                ui.label(RichText::new("in the room").size(12.0).color(DIM));
+            });
+        });
+}
+
+/// Small always-on-top banner at the top of the PC's screen. Click-through and never takes
+/// focus, so it shows over a borderless/windowed-fullscreen game without interrupting it.
+fn alert_overlay(ctx: &egui::Context, text: &str) {
+    let screen = ctx.input(|i| i.viewport().monitor_size).unwrap_or(vec2(1920.0, 1080.0));
+    let size = vec2(360.0, 78.0);
+    let builder = egui::ViewportBuilder::default()
+        .with_title("lagless alert")
+        .with_decorations(false)
+        .with_always_on_top()
+        .with_transparent(true)
+        .with_mouse_passthrough(true)
+        .with_taskbar(false)
+        .with_resizable(false)
+        .with_active(false)
+        .with_inner_size(size)
+        .with_position(pos2((screen.x - size.x) / 2.0, 40.0));
+    let text = text.to_string();
+    ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("lagless-alert"), builder, |ui, _| {
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+            egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(20, 21, 26, 238))
+                .stroke(Stroke::new(1.5, ACCENT))
+                .corner_radius(CornerRadius::same(14))
+                .inner_margin(egui::Margin::symmetric(16, 12))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        bell_icon(ui, ACCENT);
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&text).size(17.0).color(TEXT).strong());
+                            ui.label(RichText::new("heard in the room").size(11.5).color(DIM));
+                        });
+                    });
+                });
+        });
+    });
+}
+
+/// Rasterise every glyph the UI uses at every size up front. The alert overlay is a second
+/// window sharing the font texture; if new glyphs were added to it while the overlay is up
+/// (e.g. the banner's text appearing in the main window), the overlay could draw with a stale copy.
+fn warm_fonts(ctx: &egui::Context) {
+    const CHARS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,:;!?'\"()[]/-–—…·%+→×°";
+    let p = egui::Painter::new(ctx.clone(), egui::LayerId::background(), egui::Rect::NOTHING);
+    for size in [10.5, 11.0, 11.5, 12.0, 12.5, 13.0, 14.0, 15.0, 16.0, 17.0, 60.0] {
+        let _ = p.layout_no_wrap(CHARS.to_string(), FontId::proportional(size), TEXT);
+        let _ = p.layout_no_wrap(CHARS.to_string(), FontId::monospace(size), TEXT);
+    }
+}
+
+/// Painted bell (no icon font needed).
+fn bell_icon(ui: &mut Ui, col: Color32) {
+    let (r, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
+    let c = r.center();
+    let p = ui.painter();
+    let body = vec![
+        c + vec2(-7.0, 5.0),
+        c + vec2(-5.5, 3.0),
+        c + vec2(-5.0, -3.0),
+        c + vec2(-2.5, -6.5),
+        c + vec2(2.5, -6.5),
+        c + vec2(5.0, -3.0),
+        c + vec2(5.5, 3.0),
+        c + vec2(7.0, 5.0),
+    ];
+    p.add(egui::Shape::convex_polygon(body, col, Stroke::NONE));
+    p.circle_filled(c + vec2(0.0, 7.5), 2.2, col);
+    p.circle_filled(c + vec2(0.0, -7.5), 1.3, col);
 }
 
 /// Three-slider "settings" glyph, painted (no icon font needed).
