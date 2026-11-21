@@ -139,16 +139,36 @@ impl Model {
         Ok(Model { first, blocks, dense })
     }
 
-    /// The official weights, embedded in the app. Not in the Windows build: detection runs where
-    /// the mic is (the Mac), and leaving 7.5 MB of weights out keeps the PC app small.
-    #[cfg(not(windows))]
-    pub fn bundled() -> Self {
-        Self::load(include_bytes!("../assets/yamnet.bin")).expect("bundled YAMNet weights")
+    /// The official weights. On macOS they ship once in Lagless.app/Contents/Resources: the app
+    /// is a universal binary, so embedding them would carry two copies. Not in the Windows build
+    /// at all: detection runs where the mic is (the Mac). Elsewhere (dev/tests) they're embedded.
+    #[cfg(target_os = "macos")]
+    pub fn bundled() -> anyhow::Result<Self> {
+        let exe = std::env::current_exe()?;
+        let mut tried = Vec::new();
+        for p in [
+            exe.parent().and_then(|d| d.parent()).map(|c| c.join("Resources/yamnet.bin")),
+            Some(std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/yamnet.bin"))),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Ok(b) = std::fs::read(&p) {
+                return Self::load(&b).map_err(|e| anyhow::anyhow!(e));
+            }
+            tried.push(p.display().to_string());
+        }
+        anyhow::bail!("sound model not found (looked in {})", tried.join(", "))
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    pub fn bundled() -> anyhow::Result<Self> {
+        Self::load(include_bytes!("../assets/yamnet.bin")).map_err(|e| anyhow::anyhow!(e))
     }
 
     #[cfg(windows)]
-    pub fn bundled() -> Self {
-        panic!("the sound model isn't included in the Windows build")
+    pub fn bundled() -> anyhow::Result<Self> {
+        anyhow::bail!("the sound model isn't included in the Windows build")
     }
 
     pub fn available() -> bool {
@@ -334,7 +354,7 @@ mod tests {
     #[cfg(not(windows))]
     fn matches_tensorflow() {
         let dir = std::env::var("LAGLESS_YAMNET_REF").expect("set LAGLESS_YAMNET_REF");
-        let model = Model::bundled();
+        let model = Model::bundled().unwrap();
         let mut mel = LogMel::new();
         let read = |p: std::path::PathBuf| -> Vec<f32> {
             std::fs::read(p).unwrap().chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()

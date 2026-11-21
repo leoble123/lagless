@@ -168,7 +168,7 @@ fn run() -> Result<()> {
             let cats = aware::Category::ALL.to_vec();
             if let Some(f) = file {
                 let (rate, wave) = aware::read_wav(&f)?;
-                let mut d = aware::Detector::new(std::sync::Arc::new(yamnet::Model::bundled()), rate, cats, sensitivity);
+                let mut d = aware::Detector::new(std::sync::Arc::new(yamnet::Model::bundled()?), rate, cats, sensitivity);
                 for a in wave.chunks(1024).flat_map(|c| d.push(c)) {
                     println!("{:6.2}s  {}  ({:.2})", a.at, a.text, a.score);
                 }

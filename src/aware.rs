@@ -422,7 +422,7 @@ fn listen(o: &ListenOptions, stop: &std::sync::atomic::AtomicBool, out: &std::sy
     use cpal::traits::{DeviceTrait, StreamTrait};
     use std::sync::atomic::Ordering::Relaxed;
     anyhow::ensure!(Model::available(), "Sound alerts run on the Mac (where the mic is); this Windows build doesn't include the sound model.");
-    let model = Arc::new(Model::bundled());
+    let model = Arc::new(Model::bundled()?);
     // Debug/testing: play a WAV file into the detector in real time instead of the mic.
     if let Some(path) = std::env::var_os("LAGLESS_LISTEN_WAV") {
         let (rate, wave) = read_wav(std::path::Path::new(&path))?;
@@ -550,7 +550,7 @@ mod tests {
     #[test]
     #[cfg(not(windows))] // the Windows build has no sound model
     fn silence_raises_nothing() {
-        let mut d = Detector::new(Arc::new(Model::bundled()), 48_000, Category::ALL.to_vec(), 1.0);
+        let mut d = Detector::new(Arc::new(Model::bundled().unwrap()), 48_000, Category::ALL.to_vec(), 1.0);
         assert!(d.push(&vec![0.0; 48_000 * 3]).is_empty());
     }
 
@@ -561,7 +561,7 @@ mod tests {
     #[cfg(not(windows))]
     fn real_recordings() {
         let dir = std::env::var("LAGLESS_SOUND_CLIPS").expect("set LAGLESS_SOUND_CLIPS");
-        let model = Arc::new(Model::bundled());
+        let model = Arc::new(Model::bundled().unwrap());
         let expect = |label: &str| -> Option<Category> {
             Some(match label {
                 "dog" => Category::Dog,

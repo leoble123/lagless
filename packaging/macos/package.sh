@@ -26,6 +26,8 @@ for s in 16 32 128 256 512; do
   sips -z $((s*2)) $((s*2)) assets/icon-1024.png --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
 done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+# Sound-alerts model: one shared copy for both architectures (see yamnet.rs).
+cp assets/yamnet.bin assets/YAMNET_LICENSE.txt assets/YAMNET_NOTICE.md "$APP/Contents/Resources/"
 
 # Ad-hoc signature (required on Apple Silicon). For no Gatekeeper warning at all you need a
 # Developer ID certificate + notarization; set MACOS_SIGN_IDENTITY to use one.
