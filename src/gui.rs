@@ -393,6 +393,8 @@ pub struct App {
     alert: Option<(String, f64)>,
     fonts_warm: bool,
     details_open: bool,
+    /// Last time the stream had audible sound in it (to point out a silent stream).
+    last_sound: f64,
 }
 
 impl App {
@@ -418,6 +420,7 @@ impl App {
             alert: None,
             fonts_warm: false,
             details_open: false,
+            last_sound: 0.0,
             draft: settings.clone(),
             updater: Updater::start(settings.auto_update),
             unmute_to: if settings.volume > 0.0 { settings.volume } else { 0.5 },
@@ -497,7 +500,11 @@ impl App {
 
     fn tick(&mut self, now: f64) {
         self.status = self.engine.shared.snapshot();
-        let _ = self.engine.shared.take_levels();
+        let lv = self.engine.shared.take_levels();
+        // Count anything above about -70 dB as sound; give a fresh stream a moment first.
+        if lv[0].max(lv[1]) > 3e-4 || self.status.phase != Phase::Streaming {
+            self.last_sound = now;
+        }
         if let Some(e) = self.engine.shared.take_events().pop() {
             self.toast = Some((e, now));
         }
@@ -783,9 +790,22 @@ impl App {
                     _ => "Opus".into(),
                 };
                 let who = peer.unwrap_or(if sending { "your Mac" } else { "your PC" });
-                let line = format!("{} {who}  ·  {fmt}", if sending { "To" } else { "From" });
-                let lg = one_line(&p, &line, reg(13.5), DIM, w - 32.0);
-                p.galley(pos2(c.x - lg.size().x / 2.0, rect.max.y - 34.0), lg, DIM);
+                let now = ctx.input(|i| i.time);
+                // LIVE but nothing audible: say which end it is, so "no sound" is easy to place.
+                let (line, col) = if now - self.last_sound > 2.0 {
+                    let msg = if sending { "Sending silence · check the Windows volume" } else { "The PC is sending silence · check its volume" };
+                    (msg.to_string(), OK)
+                } else if self.settings.volume <= 0.0 {
+                    ("Muted here · tap the speaker below".to_string(), OK)
+                } else {
+                    (format!("{} {who}  ·  {fmt}", if sending { "To" } else { "From" }), DIM)
+                };
+                let lg = one_line(&p, &line, reg(13.5), col, w - 32.0);
+                p.galley(pos2(c.x - lg.size().x / 2.0, rect.max.y - 46.0), lg, col);
+                if !sending && !st.device_name.is_empty() {
+                    let dg = one_line(&p, &format!("Playing on {}", st.device_name), reg(12.0), DIM.gamma_multiply(0.8), w - 32.0);
+                    p.galley(pos2(c.x - dg.size().x / 2.0, rect.max.y - 26.0), dg, DIM);
+                }
             }
             phase => {
                 let (head, sub) = match (phase, peer) {
