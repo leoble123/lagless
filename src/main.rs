@@ -5,22 +5,7 @@
 // Release builds on Windows are GUI apps (no console window flashing up).
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-mod audio;
-mod aware;
-mod boost;
-mod codec;
-mod control;
-mod engine;
-mod gui;
-mod mic_access;
-mod net;
-mod playout;
-mod protocol;
-mod receiver;
-mod sender;
-mod update;
-mod voice;
-mod yamnet;
+use lagless::{audio, aware, engine, gui, protocol, receiver, sender, update, yamnet};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

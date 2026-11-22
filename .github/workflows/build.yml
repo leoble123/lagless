@@ -47,9 +47,27 @@ jobs:
           name: windows
           path: dist/lagless-windows-x64.exe*
 
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - name: Android SDK pieces
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.2.12479018" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+      - run: android/build-apk.sh
+      - run: cd dist && sha256sum lagless-android.apk > lagless-android.apk.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist/lagless-android.apk*
+
   release:
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
-    needs: [macos, windows]
+    needs: [macos, windows, android]
     runs-on: ubuntu-latest
     permissions:
       contents: write

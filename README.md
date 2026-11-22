@@ -15,6 +15,7 @@ Grab the latest from **[Releases](https://github.com/leoble123/lagless/releases/
 
 - **Mac:** `Lagless.dmg`. Open it and drag Lagless to Applications.
 - **Windows:** `lagless-windows-x64.exe`. It's a single file with no installer; put it anywhere and run it.
+- **Android:** `lagless-android.apk`. Your phone becomes another speaker or headphone output for the PC (see below).
 
 Both are the same app. Windows starts as the **sender** and the Mac starts as the **receiver**; you can flip either one with the Send / Receive switch.
 
@@ -33,6 +34,25 @@ The window is kept deliberately quiet: nothing moves while you're streaming.
 - **Mic:** one switch to send the Mac's mic to the PC (see below).
 - **Details** (collapsed by default): the link, format, round trip, buffer and dropout counts.
 - **Settings** (sliders icon): output device (DACs and IEM amps), latency floor, device buffer, capture source, quality and loss protection.
+
+## Many devices at once
+
+The PC streams to **every** lagless receiver it finds: Macs, phones and other PCs, all at once. With more than one device, the PC window lists them. Untick one to stop sending to it without interrupting the others.
+
+- **Quality per device:** each device gets its own fastest path, its own loss protection and its own quality. A phone on weak Wi-Fi drops itself to Opus without affecting anyone else. The audio is encoded once per quality level, however many devices there are, so the PC's CPU use stays flat.
+- **Crowds:** the first 5 devices get lossless 24-bit (about 2–5 Mbit/s each). Devices after that start on Opus (about 1 Mbit/s each), so a shared Wi-Fi network keeps up, and they still move to lossless on their own if their connection is clean.
+- **In sync:** switch this on when several speakers play in the same room. Every device then waits for the slowest one, so they play together instead of echoing. Faster devices get a bit more delay. It can't account for Bluetooth headphones or speakers connected to a receiver, because their delay isn't visible to the app.
+
+## Android
+
+Install `lagless-android.apk` from the release: open it on the phone and allow installing from your browser or files app when Android asks. Open lagless and it shows up on the PC like any other receiver.
+
+- **Phone Wi-Fi:** it turns off Wi-Fi power saving while it runs (Android's low-latency Wi-Fi mode). Power saving is the usual cause of choppy audio on phones.
+- **Screen off:** it keeps playing with the screen off or another app open; a "Playing audio from your computer" notification shows while it does.
+- **Receive only:** Android doesn't let apps capture other apps' sound, so the phone receives but can't send.
+- **Updates:** when a new version is out, the app shows **Get x.y.z**, which opens the download. Android can't let an app replace itself silently.
+
+The APK is signed with a key that's published in this repo (`android/lagless-public.keystore`), so every release installs over the previous one. To sign with a private key instead, set `LAGLESS_KEYSTORE_FILE`, `LAGLESS_KEYSTORE_PASSWORD`, `LAGLESS_KEY_ALIAS` and `LAGLESS_KEY_PASSWORD` when building. Switching keys means uninstalling once.
 
 ## Use the Mac's mic on the PC
 
@@ -167,6 +187,7 @@ lagless update
 Needs [Rust](https://rustup.rs) and CMake (used to build the bundled Opus library). With CMake 4+, set `CMAKE_POLICY_VERSION_MINIMUM=3.5` (the macOS script does this for you).
 - **macOS:** `brew install cmake && ./packaging/macos/package.sh` builds `dist/Lagless.app`, `Lagless.dmg` and the update zip.
 - **Windows:** `cargo build --release` builds `target\release\lagless.exe`.
+- **Android:** with the Android SDK, NDK r27 and Java 17, run `ANDROID_HOME=… ANDROID_NDK_HOME=… android/build-apk.sh`. It builds `dist/lagless-android.apk`.
 
 Set `LAGLESS_UPDATE_REPO=owner/repo` at build time to choose where auto-update looks. The release workflow sets it to this repo.
 

@@ -23,6 +23,14 @@ pub fn thread() {
         let mut idx = 0u32;
         let _ = AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut idx);
     }
+    #[cfg(target_os = "android")]
+    unsafe {
+        // THREAD_PRIORITY_AUDIO (-16): what Android's own audio threads use; allowed for apps.
+        extern "C" {
+            fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+        }
+        setpriority(0, 0, -16);
+    }
     #[cfg(target_os = "macos")]
     unsafe {
         // <pthread/qos.h>; QOS_CLASS_USER_INTERACTIVE = 0x21.

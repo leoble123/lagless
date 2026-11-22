@@ -189,6 +189,10 @@ pub fn disable_awdl() -> Result<()> {
 }
 
 pub fn hostname() -> String {
+    #[cfg(target_os = "android")]
+    if let Some(n) = crate::android::device_name() {
+        return n;
+    }
     #[cfg(target_os = "macos")]
     if let Ok(o) = std::process::Command::new("scutil").args(["--get", "ComputerName"]).output() {
         let s = String::from_utf8_lossy(&o.stdout).trim().to_string();

@@ -1933,13 +1933,15 @@ dependencies = [
 
 [[package]]
 name = "lagless"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
  "cpal",
  "eframe",
  "if-addrs",
+ "jni 0.21.1",
+ "ndk-context",
  "nnnoiseless",
  "opus",
  "rtrb",
@@ -1951,8 +1953,17 @@ dependencies = [
  "socket2",
  "ureq",
  "windows 0.54.0",
+ "winit",
  "winresource",
  "zip",
+]
+
+[[package]]
+name = "lagless-android"
+version = "0.0.0"
+dependencies = [
+ "lagless",
+ "winit",
 ]
 
 [[package]]

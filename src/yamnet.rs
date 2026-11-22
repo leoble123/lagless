@@ -112,7 +112,7 @@ fn same(n: usize, stride: usize) -> (usize, usize) {
 }
 
 impl Model {
-    #[cfg_attr(windows, allow(dead_code))]
+    #[cfg_attr(any(windows, target_os = "android"), allow(dead_code))]
     pub fn load(blob: &[u8]) -> Result<Self, &'static str> {
         if blob.len() < 8 || &blob[0..4] != b"YAMN" {
             return Err("not a YAMNet weights blob");
@@ -161,18 +161,18 @@ impl Model {
         anyhow::bail!("sound model not found (looked in {})", tried.join(", "))
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "android")))]
     pub fn bundled() -> anyhow::Result<Self> {
         Self::load(include_bytes!("../assets/yamnet.bin")).map_err(|e| anyhow::anyhow!(e))
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     pub fn bundled() -> anyhow::Result<Self> {
-        anyhow::bail!("the sound model isn't included in the Windows build")
+        anyhow::bail!("the sound model isn't included in this build")
     }
 
     pub fn available() -> bool {
-        cfg!(not(windows))
+        cfg!(not(any(windows, target_os = "android")))
     }
 
     /// Scores (0..1, independent sigmoids) for one 96x64 log-mel patch, row-major [frame][mel].

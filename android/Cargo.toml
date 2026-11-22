@@ -1,0 +1,17 @@
+[package]
+name = "lagless-android"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Android entry point for lagless (built with cargo-ndk, packaged by android/app)"
+
+[lib]
+name = "lagless_android"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+lagless = { path = "..", default-features = false, features = ["opus"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["android-native-activity"] }

@@ -100,7 +100,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            mode: if cfg!(windows) { Mode::Send } else { Mode::Receive },
+            mode: if cfg!(windows) && !cfg!(target_os = "android") { Mode::Send } else { Mode::Receive },
             out_device: None,
             min_latency: 2.0,
             buffer: 32,
@@ -387,7 +387,11 @@ pub struct App {
 impl App {
     fn new(cc: &eframe::CreationContext) -> Self {
         style(&cc.egui_ctx);
-        let settings = Settings::load();
+        let mut settings = Settings::load();
+        if cfg!(target_os = "android") {
+            settings.mode = Mode::Receive;
+            settings.aware = false;
+        }
         let engine = Engine::start(&settings, cc.egui_ctx.clone());
         let (mic, mic_problem) = match Engine::start_mic(&settings, cc.egui_ctx.clone()) {
             Ok(m) => (m, None),
@@ -598,12 +602,14 @@ impl eframe::App for App {
                     }
                     self.volume_row(ui);
                     ui.add_space(14.0);
-                    self.mic_row(ui, &ctx);
-                    if self.settings.mode == Mode::Receive {
-                        ui.add_space(8.0);
-                        self.aware_row(ui, &ctx);
-                    } else {
-                        self.devices_list(ui);
+                    if !cfg!(target_os = "android") {
+                        self.mic_row(ui, &ctx);
+                        if self.settings.mode == Mode::Receive {
+                            ui.add_space(8.0);
+                            self.aware_row(ui, &ctx);
+                        } else {
+                            self.devices_list(ui);
+                        }
                     }
                     ui.add_space(10.0);
                     egui::ScrollArea::vertical().max_height(ui.available_height() - 36.0).show(ui, |ui| self.details(ui));
@@ -648,10 +654,13 @@ impl App {
                     }
                 }
                 ui.add_space(4.0);
-                if let Some(m) = segmented(ui, self.settings.mode) {
-                    self.settings.mode = m;
-                    self.draft.mode = m;
-                    self.restart(ctx);
+                // Phones only receive (Android can't capture other apps' audio).
+                if !cfg!(target_os = "android") {
+                    if let Some(m) = segmented(ui, self.settings.mode) {
+                        self.settings.mode = m;
+                        self.draft.mode = m;
+                        self.restart(ctx);
+                    }
                 }
             });
         });
@@ -956,18 +965,20 @@ impl App {
                         }
                     });
                     hint(ui, "Lower = less delay. Raise these if you hear crackles.");
-                    section(ui, "MICROPHONE (SENT TO THE PC)");
-                    let label = d.mic_device.clone().unwrap_or_else(|| "System default mic".into());
-                    egui::ComboBox::from_id_salt("mic").width(ui.available_width()).selected_text(label).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut d.mic_device, None, "System default mic");
-                        for n in &self.devices.inputs {
-                            ui.selectable_value(&mut d.mic_device, Some(n.clone()), n);
-                        }
-                    });
-                    ui.checkbox(&mut d.voice_focus, "Voice focus");
-                    hint(ui, "Keeps voices, removes background noise (keyboard, fans, room) and evens out your level. Adds about 20 ms to the mic only.");
-                    section(ui, "NAME ON THE NETWORK");
-                    ui.add(egui::TextEdit::singleline(&mut d.rx_name).hint_text(crate::net::hostname()).desired_width(f32::INFINITY));
+                    if !cfg!(target_os = "android") {
+                        section(ui, "MICROPHONE (SENT TO THE PC)");
+                        let label = d.mic_device.clone().unwrap_or_else(|| "System default mic".into());
+                        egui::ComboBox::from_id_salt("mic").width(ui.available_width()).selected_text(label).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut d.mic_device, None, "System default mic");
+                            for n in &self.devices.inputs {
+                                ui.selectable_value(&mut d.mic_device, Some(n.clone()), n);
+                            }
+                        });
+                        ui.checkbox(&mut d.voice_focus, "Voice focus");
+                        hint(ui, "Keeps voices, removes background noise (keyboard, fans, room) and evens out your level. Adds about 20 ms to the mic only.");
+                        section(ui, "NAME ON THE NETWORK");
+                        ui.add(egui::TextEdit::singleline(&mut d.rx_name).hint_text(crate::net::hostname()).desired_width(f32::INFINITY));
+                    }
                 }
                 Mode::Send => {
                     section(ui, "CAPTURE");
@@ -1012,7 +1023,7 @@ impl App {
                     ui.add(egui::TextEdit::singleline(&mut d.to).hint_text("Automatic — or type the Mac's IP").desired_width(f32::INFINITY));
                 }
             }
-            if d.mode == Mode::Receive {
+            if d.mode == Mode::Receive && !cfg!(target_os = "android") {
                 section(ui, "SOUND ALERTS");
                 ui.checkbox(&mut d.aware, "Listen for important sounds in the room");
                 ui.horizontal_wrapped(|ui| {
@@ -1123,6 +1134,16 @@ impl App {
                         match self.updater.apply(true) {
                             Ok(()) => std::process::exit(0),
                             Err(e) => self.toast = Some((format!("Update failed: {e:#}"), now)),
+                        }
+                    }
+                }
+                update::State::Available(v) => {
+                    if accent_button(ui, &format!("Get {v}")).on_hover_text("Opens the download; Android then asks to install it").clicked() {
+                        if let Some(url) = self.updater.download_url() {
+                            #[cfg(target_os = "android")]
+                            let _ = crate::android::open_url(&url);
+                            #[cfg(not(target_os = "android"))]
+                            ctx.open_url(egui::OpenUrl::new_tab(url));
                         }
                     }
                 }
@@ -1390,6 +1411,21 @@ fn app_icon() -> egui::IconData {
 
 fn image_from_png(bytes: &[u8]) -> Option<egui::IconData> {
     eframe::icon_data::from_png_bytes(bytes).ok()
+}
+
+/// Android entry (called from android/src/lib.rs). Same app, phone-shaped: always a receiver.
+#[cfg(target_os = "android")]
+pub fn run_android(app: winit::platform::android::activity::AndroidApp) -> eframe::Result<()> {
+    // Settings live in the app's private storage.
+    if let Some(dir) = app.internal_data_path() {
+        // SAFETY: called first thing on the main thread, before any other threads exist.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir) };
+    }
+    let _ = crate::android::keep_network_fast();
+    let _ = crate::android::request_notification_permission();
+    let _ = crate::android::start_foreground_service();
+    let opts = eframe::NativeOptions { android_app: Some(app), ..Default::default() };
+    eframe::run_native("lagless", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 
 pub fn run() -> eframe::Result<()> {

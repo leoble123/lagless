@@ -21,7 +21,9 @@ const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
 const ASSET: &str = "lagless-windows-x64.exe";
 #[cfg(target_os = "macos")]
 const ASSET: &str = "Lagless-macos.zip";
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "android")]
+const ASSET: &str = "lagless-android.apk";
+#[cfg(not(any(windows, target_os = "macos", target_os = "android")))]
 const ASSET: &str = "";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -34,7 +36,17 @@ pub enum State {
     Downloading(String),
     /// Downloaded, verified and staged; applies on restart or quit.
     Ready(String),
+    /// Android: a newer version exists. Apps can't replace themselves there, so the UI offers to
+    /// open the download (Android then asks to install it).
+    Available(String),
     Failed(String),
+}
+
+/// Android: where the newer APK is.
+impl Updater {
+    pub fn download_url(&self) -> Option<String> {
+        self.download_url.lock().unwrap().clone()
+    }
 }
 
 struct Staged {
@@ -48,11 +60,13 @@ pub struct Updater {
     state: Arc<Mutex<State>>,
     staged: Arc<Mutex<Option<Staged>>>,
     wake: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    download_url: Arc<Mutex<Option<String>>>,
 }
 
 impl Updater {
     pub fn start(enabled: bool) -> Self {
         let u = Updater {
+            download_url: Default::default(),
             state: Arc::new(Mutex::new(State::Idle)),
             staged: Default::default(),
             wake: Default::default(),
@@ -71,7 +85,7 @@ impl Updater {
                     if auto {
                         me.check_once();
                     }
-                    if matches!(*me.state.lock().unwrap(), State::Ready(_)) {
+                    if matches!(*me.state.lock().unwrap(), State::Ready(_) | State::Available(_)) {
                         return;
                     }
                     // Sleep until the next scheduled check, or until "Check now".
@@ -91,7 +105,7 @@ impl Updater {
         if REPO.is_none() || ASSET.is_empty() {
             bail!("this build has no update source (official releases update from GitHub)");
         }
-        let u = Updater { state: Arc::new(Mutex::new(State::Idle)), staged: Default::default(), wake: Default::default() };
+        let u = Updater { state: Arc::new(Mutex::new(State::Idle)), staged: Default::default(), wake: Default::default(), download_url: Default::default() };
         let v = u.try_update()?;
         if v.is_some() {
             u.apply(false)?;
@@ -116,6 +130,7 @@ impl Updater {
     fn check_once(&self) {
         self.set(State::Checking);
         match self.try_update() {
+            Ok(Some(v)) if cfg!(target_os = "android") => self.set(State::Available(v)),
             Ok(Some(v)) => self.set(State::Ready(v)),
             Ok(None) => self.set(State::UpToDate),
             Err(e) => self.set(State::Failed(format!("{e:#}"))),
@@ -141,6 +156,10 @@ impl Updater {
             rel["assets"].as_array().into_iter().flatten().find(|a| a["name"] == name).and_then(|a| a["browser_download_url"].as_str()).map(str::to_string)
         };
         let url = url_of(ASSET).ok_or_else(|| anyhow!("release {tag} has no {ASSET}"))?;
+        if cfg!(target_os = "android") {
+            *self.download_url.lock().unwrap() = Some(url);
+            return Ok(Some(version));
+        }
         let sum_url = url_of(&format!("{ASSET}.sha256")).ok_or_else(|| anyhow!("release {tag} has no checksum"))?;
 
         self.set(State::Downloading(version.clone()));
@@ -288,16 +307,16 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------- other (dev builds)
+// ---------------------------------------------------------------- other (Android, dev builds)
 
 #[cfg(not(any(windows, target_os = "macos")))]
 fn stage(_: &[u8], _: &str) -> Result<PathBuf> {
-    bail!("self-update is only packaged for Windows and macOS")
+    bail!("self-update installs on Windows and macOS only")
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
 fn install(_: &Path, _: bool) -> Result<()> {
-    bail!("self-update is only packaged for Windows and macOS")
+    bail!("self-update installs on Windows and macOS only")
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
