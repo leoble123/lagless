@@ -58,6 +58,8 @@ pub struct Options {
     pub exclude: Vec<String>,
     /// Make every device play at the same delay (the slowest one's), e.g. speakers in one room.
     pub sync: bool,
+    /// Windows: the PC's volume dial/keys/mute also set the stream's level.
+    pub follow_system_volume: bool,
     pub tone_rate: u32,
 }
 
@@ -299,6 +301,11 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
         });
     }
     let mut cap = open_capture(&o)?;
+    let system_volume = if o.source == Source::Loopback && o.follow_system_volume { crate::boost::follow_system_volume(o.device.clone()) } else { None };
+    if system_volume.is_some() {
+        sh.event("Following the Windows volume");
+    }
+    let mut last_gain = 1.0f32;
     let my_name = net::hostname();
     let wants_voice = o.voice_focus && o.source == Source::Input;
     let mut voice = if wants_voice { crate::voice::VoiceFocus::new(cap.rate) } else { None };
@@ -381,10 +388,17 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
             } else {
                 downmix(&frame, cap.channels, &mut wire);
             }
-            let g = sh.volume.get();
-            if g < 0.9999 {
-                wire.iter_mut().for_each(|s| *s *= g);
+            // In-app slider x Windows volume, glided across the frame so turning the dial is smooth.
+            let sys = system_volume.as_ref().map_or(1.0, |v| v.gain());
+            let g = sh.volume.get() * sys;
+            if g < 0.9999 || last_gain < 0.9999 {
+                let frames = (wire.len() / wire_ch.max(1)).max(1);
+                for (i, f) in wire.chunks_exact_mut(wire_ch.max(1)).enumerate() {
+                    let k = last_gain + (g - last_gain) * (i + 1) as f32 / frames as f32;
+                    f.iter_mut().for_each(|s| *s *= k);
+                }
             }
+            last_gain = g;
             sh.meter(&wire, wire_ch);
 
             let mut flags = 0;
@@ -538,7 +552,7 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
         if last_status.elapsed() >= Duration::from_millis(250) {
             last_status = Instant::now();
             let codec_of = |l: Lane| if l == Lane::Lossless { lossless.enc.codec() } else { Codec::Opus };
-            publish(&sh, &peers, codec_of, rate, &cap, fs, last_capture, voice.is_some());
+            publish(&sh, &peers, codec_of, rate, &cap, fs, last_capture, voice.is_some(), system_volume.as_ref().map(|v| v.gain()));
             // A device that never delivers a single buffer is almost always a permission problem
             // (macOS gives a denied app silence-by-absence, no error). Say so instead of "idle".
             let never = cap.chunk.load(Relaxed) == 0;
@@ -614,7 +628,7 @@ fn downmix(input: &[f32], ch: usize, out: &mut Vec<f32>) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn publish(sh: &Shared, peers: &HashMap<u64, Peer>, codec_of: impl Fn(Lane) -> Codec, rate: u32, cap: &Capture, fs: usize, last_capture: Instant, voice: bool) {
+fn publish(sh: &Shared, peers: &HashMap<u64, Peer>, codec_of: impl Fn(Lane) -> Codec, rate: u32, cap: &Capture, fs: usize, last_capture: Instant, voice: bool, system_volume: Option<f32>) {
     let flowing = last_capture.elapsed() < Duration::from_millis(500);
     let sender_ms = (cap.chunk.load(Relaxed) as f64 / cap.rate as f64 + fs as f64 / rate as f64 + if voice { crate::voice::DELAY_SECS } else { 0.0 }) * 1000.0;
     let mut list: Vec<PeerStatus> = peers
@@ -650,6 +664,7 @@ fn publish(sh: &Shared, peers: &HashMap<u64, Peer>, codec_of: impl Fn(Lane) -> C
         });
     sh.update(|s| {
         s.capturing = flowing;
+        s.system_volume = system_volume;
         s.peers = list;
         let Some(p) = primary else {
             s.phase = Phase::Searching;

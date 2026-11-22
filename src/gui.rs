@@ -79,6 +79,8 @@ pub struct Settings {
     pub excluded_devices: Vec<String>,
     /// PC: make every device play at the same delay (speakers in one room).
     pub sync_devices: bool,
+    /// PC: the Windows volume dial/keys/mute also set the stream's level.
+    pub follow_windows_volume: bool,
     /// Mac mic: noise suppression + voice leveling before sending.
     pub voice_focus: bool,
     /// Sound awareness (Mac): listen to the room and flag important sounds.
@@ -120,6 +122,7 @@ impl Default for Settings {
             tuning: 1,
             excluded_devices: Vec::new(),
             sync_devices: false,
+            follow_windows_volume: true,
             voice_focus: true,
             aware: false,
             aware_categories: crate::aware::Category::ALL.iter().copied().filter(|c| c.on_by_default()).collect(),
@@ -241,6 +244,7 @@ impl Engine {
                         voice_focus: false,
                         exclude: s.excluded_devices.clone(),
                         sync: s.sync_devices,
+                        follow_system_volume: s.follow_windows_volume,
                     },
                     sh,
                 )
@@ -273,6 +277,7 @@ impl Engine {
                         voice_focus: s.voice_focus,
                         exclude: Vec::new(),
                         sync: false,
+                        follow_system_volume: false,
                     },
                     sh,
                 )
@@ -734,7 +739,7 @@ impl App {
     }
 
     fn volume_row(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
+        let sys = ui.horizontal(|ui| {
             let muted = self.settings.volume <= 0.0;
             if speaker_icon(ui, muted).on_hover_text(if muted { "Unmute" } else { "Mute" }).clicked() {
                 if muted {
@@ -746,6 +751,8 @@ impl App {
                 self.apply_volume(true);
             }
             let pct = format!("{:.0}%", self.settings.volume * 100.0);
+            // Show the Windows volume alongside when it's being followed and isn't at full.
+            let sys = self.status.system_volume.filter(|g| *g < 0.999 && self.settings.mode == Mode::Send);
             ui.spacing_mut().slider_width = ui.available_width() - 44.0;
             let r = ui.add(egui::Slider::new(&mut self.settings.volume, 0.0..=1.0).show_value(false));
             if r.changed() {
@@ -755,7 +762,13 @@ impl App {
                 self.settings.save();
             }
             ui.label(RichText::new(pct).size(12.0).color(DIM).monospace());
-        });
+            sys
+        })
+        .inner;
+        if let Some(g) = sys {
+            let txt = if g <= 0.0 { "Windows is muted".to_string() } else { format!("× Windows volume {:.0} dB", 20.0 * g.log10()) };
+            ui.label(RichText::new(txt).size(11.0).color(DIM));
+        }
     }
 
     /// Push the slider to the running engine immediately; optionally persist.
@@ -1071,6 +1084,8 @@ impl App {
             ui.checkbox(&mut d.multipath, "Send over two links at once");
             hint(ui, "With a cable and Wi-Fi both connected, every packet goes both ways and the first to arrive wins.");
             if cfg!(windows) {
+                ui.checkbox(&mut d.follow_windows_volume, "Follow the Windows volume");
+                hint(ui, "The PC's volume dial, keys and mute also set the level on every device. Turn off if you mute the PC to silence its own speakers.");
                 ui.checkbox(&mut d.engine_boost, "Speed up the Windows audio engine");
                 let st = &self.status;
                 if st.engine_ms > 0.0 {

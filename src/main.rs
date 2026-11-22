@@ -142,7 +142,7 @@ fn run() -> Result<()> {
         Cmd::Send { to, port, name, codec, frame_ms, fec, bitrate, source, device, sim_loss, tone_rate, no_multipath, no_engine_boost, voice_focus, sync } => {
             let o = sender::Options {
                 to, port, name, codec, frame_ms, redundancy: fec.min(8), bitrate_kbps: bitrate, source, device, sim_loss, tone_rate,
-                multipath: !no_multipath, engine_boost: !no_engine_boost, voice_focus, exclude: Vec::new(), sync,
+                multipath: !no_multipath, engine_boost: !no_engine_boost, voice_focus, exclude: Vec::new(), sync, follow_system_volume: true,
             };
             Box::new(move || sender::run(o, worker))
         }

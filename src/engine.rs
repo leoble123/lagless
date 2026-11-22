@@ -114,6 +114,8 @@ pub struct Status {
     pub engine_ms: f32,
     /// Sender: audio is coming in from the capture device.
     pub capturing: bool,
+    /// Sender: the Windows volume being followed (linear gain), if any.
+    pub system_volume: Option<f32>,
     /// Sender: every device being streamed to.
     pub peers: Vec<PeerStatus>,
     /// Receiver: worst gap between packets over the last few seconds (what the buffer must cover).
@@ -147,6 +149,7 @@ impl Default for Status {
             jitter_ms: 0.0,
             capturing: false,
             peers: Vec::new(),
+            system_volume: None,
             engine_default_ms: 0.0,
         }
     }
