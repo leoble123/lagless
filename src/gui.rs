@@ -415,7 +415,9 @@ impl App {
             mic,
             mic_status: Status::default(),
             mic_problem,
-            devices: Devices::scan(),
+            // Listed when settings open; at startup it would only slow the first frame (and on
+            // Android it goes through Java).
+            devices: Devices { outputs: Vec::new(), inputs: Vec::new() },
             show_settings: false,
             shown_latency: (0.0, -10.0),
             toast: None,
@@ -576,6 +578,13 @@ impl eframe::App for App {
         if !self.fonts_warm {
             warm_fonts(&ctx);
             self.fonts_warm = true;
+            #[cfg(target_os = "android")]
+            {
+                let _ = crate::android::request_notification_permission();
+                if let Err(e) = crate::android::start_foreground_service() {
+                    crate::android::log(&format!("foreground service: {e}"));
+                }
+            }
         }
         let now = ctx.input(|i| i.time);
         self.tick(now);
@@ -1421,9 +1430,12 @@ pub fn run_android(app: winit::platform::android::activity::AndroidApp) -> efram
         // SAFETY: called first thing on the main thread, before any other threads exist.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir) };
     }
-    let _ = crate::android::keep_network_fast();
-    let _ = crate::android::request_notification_permission();
-    let _ = crate::android::start_foreground_service();
+    crate::android::set_activity(app.activity_as_ptr());
+    if let Err(e) = crate::android::keep_network_fast() {
+        crate::android::log(&format!("network locks: {e}"));
+    }
+    // The notification permission and the playback service wait for the first frame: Android 12+
+    // only lets an app start a foreground service once its window is actually showing.
     let opts = eframe::NativeOptions { android_app: Some(app), ..Default::default() };
     eframe::run_native("lagless", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }

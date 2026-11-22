@@ -8,20 +8,67 @@
 //!   playing with the screen off.
 //! * Opening a link in the browser (updates).
 
-use jni::objects::{JObject, JValue};
+use jni::objects::{GlobalRef, JObject, JValue};
 use jni::JNIEnv;
+use std::sync::OnceLock;
 
+/// The NativeActivity (android-activity registers the *Application* as ndk_context's context;
+/// a few calls, like asking for a permission, need the Activity itself).
+static ACTIVITY: OnceLock<GlobalRef> = OnceLock::new();
+
+pub fn set_activity(activity_ptr: *mut std::ffi::c_void) {
+    let _ = with_env(|env, _| {
+        let local = unsafe { JObject::from_raw(activity_ptr.cast()) };
+        let global = env.new_global_ref(&local)?;
+        let _ = ACTIVITY.set(global);
+        Ok(())
+    });
+}
+
+/// Runs `f` with a JNI env and the app context (the Application). Java exceptions become errors
+/// and are cleared, so a failing call can never take the app down.
 fn with_env<T>(f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<T>) -> anyhow::Result<T> {
     let ctx = ndk_context::android_context();
     let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast())? };
     let mut env = vm.attach_current_thread()?;
-    let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
-    let r = f(&mut env, &activity);
+    let app = unsafe { JObject::from_raw(ctx.context().cast()) };
+    let r = f(&mut env, &app);
     if env.exception_check().unwrap_or(false) {
         let _ = env.exception_describe();
         let _ = env.exception_clear();
     }
     Ok(r?)
+}
+
+/// Write a line to logcat (tag "lagless").
+pub fn log(msg: &str) {
+    extern "C" {
+        fn __android_log_write(prio: i32, tag: *const std::ffi::c_char, text: *const std::ffi::c_char) -> i32;
+    }
+    let text = std::ffi::CString::new(msg.replace('\0', " ")).unwrap_or_default();
+    // ANDROID_LOG_WARN = 5
+    unsafe { __android_log_write(5, c"lagless".as_ptr(), text.as_ptr()) };
+}
+
+/// Open CrashActivity (its own process, so it survives this one exiting) showing `text`.
+pub fn show_crash(text: &str) {
+    log(text);
+    let r = with_env(|env, app| {
+        let loader = env.call_method(app, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?.l()?;
+        let name = env.new_string("app.lagless.CrashActivity")?;
+        let class = env.call_method(&loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", &[JValue::Object(&name)])?.l()?;
+        let intent = env.new_object("android/content/Intent", "(Landroid/content/Context;Ljava/lang/Class;)V", &[JValue::Object(app), JValue::Object(&class)])?;
+        let key = env.new_string("text")?;
+        let val = env.new_string(text)?;
+        env.call_method(&intent, "putExtra", "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;", &[JValue::Object(&key), JValue::Object(&val)])?;
+        // FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TASK
+        env.call_method(&intent, "addFlags", "(I)Landroid/content/Intent;", &[JValue::Int(0x1000_0000 | 0x0000_8000)])?;
+        env.call_method(app, "startActivity", "(Landroid/content/Intent;)V", &[JValue::Object(&intent)])?;
+        Ok(())
+    });
+    if let Err(e) = r {
+        log(&format!("couldn't show the crash screen: {e}"));
+    }
 }
 
 fn system_service<'a>(env: &mut JNIEnv<'a>, activity: &JObject, name: &str) -> jni::errors::Result<JObject<'a>> {
@@ -68,7 +115,8 @@ pub fn keep_network_fast() -> anyhow::Result<()> {
 /// Start app.lagless.LaglessService as a foreground service (media playback), so Android keeps
 /// the app running and playing when the screen is off or you switch apps.
 pub fn start_foreground_service() -> anyhow::Result<()> {
-    with_env(|env, activity| {
+    with_env(|env, app| {
+        let activity = ACTIVITY.get().map(|g| g.as_obj()).unwrap_or(app);
         // App classes aren't visible to FindClass from a native thread: use the app's loader.
         let loader = env.call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?.l()?;
         let name = env.new_string("app.lagless.LaglessService")?;
@@ -81,10 +129,11 @@ pub fn start_foreground_service() -> anyhow::Result<()> {
 
 /// Ask for the notification permission (Android 13+) so the "playing" notification shows.
 pub fn request_notification_permission() -> anyhow::Result<()> {
-    with_env(|env, activity| {
+    with_env(|env, _app| {
         if sdk_int(env) < 33 {
             return Ok(());
         }
+        let Some(activity) = ACTIVITY.get().map(|g| g.as_obj()) else { return Ok(()) };
         let perm = env.new_string("android.permission.POST_NOTIFICATIONS")?;
         let arr = env.new_object_array(1, "java/lang/String", &perm)?;
         env.call_method(activity, "requestPermissions", "([Ljava/lang/String;I)V", &[JValue::Object(&arr), JValue::Int(1)])?;
