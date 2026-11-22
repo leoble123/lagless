@@ -41,11 +41,14 @@ The PC streams to **every** lagless receiver it finds: Macs, phones and other PC
 
 - **Quality per device:** each device gets its own fastest path, its own loss protection and its own quality. A phone on weak Wi-Fi drops itself to Opus without affecting anyone else. The audio is encoded once per quality level, however many devices there are, so the PC's CPU use stays flat.
 - **Crowds:** the first 5 devices get lossless 24-bit (about 2–5 Mbit/s each). Devices after that start on Opus (about 1 Mbit/s each), so a shared Wi-Fi network keeps up, and they still move to lossless on their own if their connection is clean.
+- **PC volume dial:** the Windows volume (dial, keys, mute) sets the level on every device, on top of lagless's own slider. Turn off *Follow the Windows volume* in settings if you mute the PC to silence its own speakers.
 - **In sync:** switch this on when several speakers play in the same room. Every device then waits for the slowest one, so they play together instead of echoing. Faster devices get a bit more delay. It can't account for Bluetooth headphones or speakers connected to a receiver, because their delay isn't visible to the app.
 
 ## Android
 
 Install `lagless-android.apk` from the release: open it on the phone and allow installing from your browser or files app when Android asks. Open lagless and it shows up on the PC like any other receiver.
+
+The Android app uses Android's own UI components, so the screen never depends on the phone's graphics driver. The audio engine underneath is the same Rust code as on the desktop.
 
 - **Phone Wi-Fi:** it turns off Wi-Fi power saving while it runs (Android's low-latency Wi-Fi mode). Power saving is the usual cause of choppy audio on phones.
 - **Screen off:** it keeps playing with the screen off or another app open; a "Playing audio from your computer" notification shows while it does.
@@ -187,7 +190,7 @@ lagless update
 Needs [Rust](https://rustup.rs) and CMake (used to build the bundled Opus library). With CMake 4+, set `CMAKE_POLICY_VERSION_MINIMUM=3.5` (the macOS script does this for you).
 - **macOS:** `brew install cmake && ./packaging/macos/package.sh` builds `dist/Lagless.app`, `Lagless.dmg` and the update zip.
 - **Windows:** `cargo build --release` builds `target\release\lagless.exe`.
-- **Android:** with the Android SDK, NDK r27 and Java 17, run `ANDROID_HOME=… ANDROID_NDK_HOME=… android/build-apk.sh`. It builds `dist/lagless-android.apk`.
+- **Android:** with the Android SDK, NDK r27 and Java 17, run `ANDROID_HOME=… ANDROID_NDK_HOME=… android/build-apk.sh`. It builds `dist/lagless-android.apk`. `android/test-harness/run.sh` checks the JNI bridge on a desktop JVM against a live stream.
 
 Set `LAGLESS_UPDATE_REPO=owner/repo` at build time to choose where auto-update looks. The release workflow sets it to this repo.
 

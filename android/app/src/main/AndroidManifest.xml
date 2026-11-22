@@ -16,22 +16,21 @@
         android:hasCode="true"
         android:allowBackup="false">
 
-        <!-- The whole UI is Rust (egui) in liblagless_android.so; NativeActivity hosts it.
-             configChanges: rotating or resizing must not restart the native app. -->
+        <!-- The screen is plain Android views (MainActivity.java); the audio engine is Rust,
+             loaded from liblagless_android.so. -->
         <activity
-            android:name="android.app.NativeActivity"
+            android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale">
-            <meta-data android:name="android.app.lib_name" android:value="lagless_android" />
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|uiMode">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 
-        <!-- Shows the error if the native app fails to start (instead of just closing). -->
+        <!-- Shows the details if the app hits an unexpected error (instead of just closing). -->
         <activity
             android:name=".CrashActivity"
             android:exported="false"
