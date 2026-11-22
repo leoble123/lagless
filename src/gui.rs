@@ -18,7 +18,6 @@ use std::time::Duration;
 // ------------------------------------------------------------------ palette
 
 const BG: Color32 = Color32::from_rgb(0, 0, 0);
-const GROUP: Color32 = Color32::from_rgb(28, 28, 30);
 const RAISED: Color32 = Color32::from_rgb(44, 44, 46);
 const SEP: Color32 = Color32::from_rgb(56, 56, 58);
 const TRACK: Color32 = Color32::from_rgb(57, 57, 61);
@@ -103,6 +102,8 @@ pub struct Settings {
     /// Volume slider position, 0..1 (see `Volume::slider_to_gain`).
     pub volume: f32,
     pub auto_update: bool,
+    /// See-through, blurred window background (macOS vibrancy / Windows 11 Mica).
+    pub glass: bool,
 }
 
 impl Default for Settings {
@@ -138,6 +139,7 @@ impl Default for Settings {
             aware_notify: true,
             volume: 1.0,
             auto_update: true,
+            glass: true,
         }
     }
 }
@@ -394,6 +396,8 @@ pub struct App {
     alert: Option<(String, f64)>,
     fonts_warm: bool,
     details_open: bool,
+    /// The window really is see-through (the OS accepted the blur).
+    glass_on: bool,
 }
 
 impl App {
@@ -412,6 +416,7 @@ impl App {
         let wake = cc.egui_ctx.clone();
         let control = Control::start(settings_path().and_then(|p| p.parent().map(|d| d.to_path_buf())), move || wake.request_repaint());
         let listener = start_listener(&settings, &cc.egui_ctx);
+        let glass_on = settings.glass && apply_glass(cc);
         App {
             control,
             paused: false,
@@ -419,6 +424,7 @@ impl App {
             alert: None,
             fonts_warm: false,
             details_open: false,
+            glass_on,
             draft: settings.clone(),
             updater: Updater::start(settings.auto_update),
             unmute_to: if settings.volume > 0.0 { settings.volume } else { 0.5 },
@@ -595,8 +601,10 @@ impl eframe::App for App {
         let now = ctx.input(|i| i.time);
         self.tick(now);
 
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| {
+        let fill = if self.glass_on { black(0.32) } else { BG };
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(fill)).show(ui, |ui| {
             let full = ui.max_rect();
+            ambient(ui.painter(), full);
             // Settings is a page pushed in from the right, iOS style; the main page slides a
             // little the other way and dims underneath it.
             let t = ctx.animate_bool_with_time_and_easing(egui::Id::unique("settings-page"), self.show_settings, 0.32, egui::emath::easing::cubic_out);
@@ -604,22 +612,22 @@ impl eframe::App for App {
                 let r = full.translate(vec2(-full.width() * 0.28 * t, 0.0));
                 let mut page = ui.new_child(egui::UiBuilder::new().max_rect(r).id_salt("main-page"));
                 page.set_clip_rect(full);
+                page.multiply_opacity((1.0 - t * 1.6).max(0.0));
                 self.main_page(&mut page, &ctx);
-                if t > 0.0 {
-                    ui.painter().rect_filled(full, 0.0, black(t * 0.5));
-                }
             }
             if t > 0.0 {
                 let r = full.translate(vec2(full.width() * (1.0 - t), 0.0));
-                let p = ui.painter().with_clip_rect(full);
-                for i in 0..10 {
-                    let s = (i + 1) as f32 * 1.6;
-                    p.rect_filled(Rect::from_min_max(pos2(r.min.x - s, r.min.y), pos2(r.min.x, r.max.y)), 0.0, black(0.035 * (1.0 - t * 0.6)));
-                }
-                p.rect_filled(r, 0.0, BG);
                 let mut page = ui.new_child(egui::UiBuilder::new().max_rect(r).id_salt("settings-page"));
                 page.set_clip_rect(full);
+                page.multiply_opacity(t);
                 self.settings_page(&mut page, &ctx);
+            }
+            // macOS: the content runs under the (transparent) title bar; keep that strip draggable.
+            if TOP_INSET > 0.0 {
+                let bar = ui.interact(Rect::from_min_size(full.min, vec2(full.width(), TOP_INSET)), egui::Id::unique("titlebar-drag"), Sense::drag());
+                if bar.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
             }
         });
         self.toast(&ctx, now);
@@ -643,7 +651,11 @@ impl eframe::App for App {
     }
 
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
-        BG.to_normalized_gamma_f32()
+        if self.glass_on {
+            [0.0; 4]
+        } else {
+            BG.to_normalized_gamma_f32()
+        }
     }
 }
 
@@ -652,7 +664,7 @@ impl eframe::App for App {
 impl App {
     fn main_page(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         egui::ScrollArea::vertical().id_salt("main-scroll").auto_shrink([false, false]).show(ui, |ui| {
-            egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 10, bottom: 18 }).show(ui, |ui| {
+            egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 10 + TOP_INSET as i8, bottom: 18 }).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = vec2(8.0, 0.0);
                 self.title_bar(ui);
                 ui.add_space(12.0);
@@ -731,7 +743,7 @@ impl App {
         let w = ui.available_width();
         let (rect, _) = ui.allocate_exact_size(vec2(w, 188.0), Sense::hover());
         let p = ui.painter().clone();
-        p.rect_filled(rect, 20.0, GROUP);
+        glass(&p, rect, 20.0);
 
         let lat = self.shown_latency.0;
         let peer = (!st.peer_name.is_empty()).then_some(st.peer_name.as_str());
@@ -857,7 +869,7 @@ impl App {
 
         let p = ui.painter().clone();
         let clip = ui.clip_rect();
-        p.rect_filled(rect, 18.0, GROUP);
+        glass(&p, rect, 18.0);
         let split = rect.min.x + rect.width() * shown;
         let filled = p.with_clip_rect(Rect::from_min_max(rect.min, pos2(split, rect.max.y)).intersect(clip));
         let empty = p.with_clip_rect(Rect::from_min_max(pos2(split, rect.min.y), rect.max).intersect(clip));
@@ -1061,7 +1073,8 @@ impl App {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::new()
-                    .fill(RAISED.gamma_multiply(a))
+                    .fill(Color32::from_rgba_unmultiplied(50, 50, 54, (230.0 * a) as u8))
+                    .stroke(Stroke::new(1.0, Color32::from_white_alpha((26.0 * a) as u8)))
                     .corner_radius(CornerRadius::same(18))
                     .inner_margin(egui::Margin::symmetric(16, 9))
                     .shadow(egui::Shadow { offset: [0, 4], blur: 18, spread: 0, color: black(0.5 * a) })
@@ -1078,7 +1091,7 @@ impl App {
 
 impl App {
     fn settings_page(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
+        egui::Frame::new().inner_margin(egui::Margin { left: 8, right: 8, top: 6 + TOP_INSET as i8, bottom: 6 }).show(ui, |ui| {
             let w = ui.available_width();
             let (rect, _) = ui.allocate_exact_size(vec2(w, 40.0), Sense::hover());
             let p = ui.painter().clone();
@@ -1246,6 +1259,12 @@ impl App {
                 }
             }
         }
+        if cfg!(any(target_os = "macos", windows)) {
+            let note = if cfg!(windows) { "Your wallpaper tints the window (Windows 11). Applies the next time lagless opens." } else { "Your desktop shows through, blurred. Applies the next time lagless opens." };
+            group(ui, "Appearance", note, |ui| {
+                row(ui, Some((Glyph::Sparkle, PURPLE)), "Glass window", TEXT, None, Trail::Switch(&mut d.glass));
+            });
+        }
         group(ui, "Updates", "", |ui| {
             row(ui, Some((Glyph::Download, GRAY)), "Update automatically", TEXT, None, Trail::Switch(&mut d.auto_update));
             let state = match self.updater.state() {
@@ -1362,15 +1381,14 @@ fn group<R>(ui: &mut Ui, header: &str, footer: &str, add: impl FnOnce(&mut Ui) -
             ui.label(RichText::new(header.to_uppercase()).font(reg(12.0)).color(DIM));
         });
     }
-    let r = egui::Frame::new()
-        .fill(GROUP)
-        .corner_radius(CornerRadius::same(14))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 0.0;
-            add(ui)
-        })
-        .inner;
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let shown = egui::Frame::new().corner_radius(CornerRadius::same(14)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 0.0;
+        add(ui)
+    });
+    ui.painter().set(bg, glass_shape(shown.response.rect, 14.0));
+    let r = shown.inner;
     if !footer.is_empty() {
         ui.add_space(7.0);
         caption(ui, footer);
@@ -1517,6 +1535,78 @@ fn glow(p: &egui::Painter, c: Pos2, r: f32, col: Color32) {
     p.add(m);
 }
 
+/// Points around a rounded rectangle, clockwise from the top-left corner.
+fn rrect_points(rect: Rect, r: f32) -> Vec<Pos2> {
+    let r = r.min(rect.width() / 2.0).min(rect.height() / 2.0);
+    let mut pts = Vec::with_capacity(40);
+    let corners = [(rect.left_top() + vec2(r, r), 180.0f32), (rect.right_top() + vec2(-r, r), 270.0), (rect.right_bottom() + vec2(-r, -r), 0.0), (rect.left_bottom() + vec2(r, -r), 90.0)];
+    for (c, start) in corners {
+        for i in 0..=8 {
+            let a = (start + 90.0 * i as f32 / 8.0).to_radians();
+            pts.push(c + vec2(a.cos(), a.sin()) * r);
+        }
+    }
+    pts
+}
+
+/// Frosted glass: a translucent body that's a touch brighter at the top (what shows through it,
+/// the ambient glows or the blurred desktop, does the rest) and a rim of light along the top edge.
+fn glass_shape(rect: Rect, r: f32) -> egui::Shape {
+    glass_shape_with(rect, r, Color32::from_white_alpha(22), Color32::from_white_alpha(10), 44.0)
+}
+
+fn glass_shape_with(rect: Rect, r: f32, top: Color32, bottom: Color32, rim: f32) -> egui::Shape {
+    let pts = rrect_points(rect, r);
+    let shade = move |y: f32| top.lerp_to_gamma(bottom, ((y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0));
+    let mut m = egui::Mesh::default();
+    m.colored_vertex(rect.center(), shade(rect.center().y));
+    for p in &pts {
+        m.colored_vertex(*p, shade(p.y));
+    }
+    let n = pts.len() as u32;
+    for i in 0..n {
+        m.add_triangle(0, 1 + i, 1 + (i + 1) % n);
+    }
+    let (y0, h) = (rect.top(), rect.height().max(1.0));
+    let stroke = egui::epaint::PathStroke::new_uv(1.0, move |_, pos| {
+        let t = ((pos.y - y0) / h).clamp(0.0, 1.0);
+        Color32::from_white_alpha((rim * (1.0 - t).powi(3) + 7.0) as u8)
+    });
+    egui::Shape::Vec(vec![egui::Shape::mesh(m), egui::Shape::Path(egui::epaint::PathShape::closed_line(pts, stroke))])
+}
+
+fn glass(p: &egui::Painter, rect: Rect, r: f32) {
+    p.add(glass_shape(rect, r));
+}
+
+/// Soft colored light behind everything, for the glass to pick up. Static.
+fn ambient(p: &egui::Painter, full: Rect) {
+    glow(p, full.left_top() + vec2(40.0, 150.0), 340.0, ACCENT.gamma_multiply(0.30));
+    glow(p, full.right_bottom() + vec2(-20.0, -160.0), 320.0, PURPLE.gamma_multiply(0.24));
+    glow(p, pos2(full.right() - 40.0, full.top() + 40.0), 200.0, TEAL.gamma_multiply(0.14));
+}
+
+/// Real see-through window where the OS offers one; false (opaque window) otherwise.
+fn apply_glass(cc: &eframe::CreationContext) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial, NSVisualEffectState};
+        return apply_vibrancy(cc, NSVisualEffectMaterial::HudWindow, Some(NSVisualEffectState::Active), None).is_ok();
+    }
+    #[cfg(windows)]
+    {
+        return window_vibrancy::apply_mica(cc, Some(true)).is_ok();
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = cc;
+        false
+    }
+}
+
+/// macOS draws the traffic lights over our content (transparent title bar).
+const TOP_INSET: f32 = if cfg!(target_os = "macos") { 28.0 } else { 0.0 };
+
 fn checkmark(p: &egui::Painter, c: Pos2, col: Color32) {
     let pts = vec![c + vec2(-4.8, 0.2), c + vec2(-1.6, 3.4), c + vec2(4.8, -3.4)];
     p.add(egui::Shape::line(pts, Stroke::new(2.0, col)));
@@ -1621,7 +1711,11 @@ fn segmented<T: PartialEq + Copy>(ui: &mut Ui, id: &str, value: T, options: &[(T
     let w = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
     let p = ui.painter().clone();
-    p.rect_filled(rect, 9.0, track);
+    if track == SEG_ON_BG {
+        glass(&p, rect, 10.0);
+    } else {
+        p.rect_filled(rect, 9.0, track);
+    }
     let n = options.len().max(1) as f32;
     let seg = w / n;
     let idx = options.iter().position(|(v, _)| *v == value).unwrap_or(0) as f32;
@@ -1629,7 +1723,7 @@ fn segmented<T: PartialEq + Copy>(ui: &mut Ui, id: &str, value: T, options: &[(T
     let x = ui.ctx().animate_value_with_time(base, idx, 0.24);
     let hl = Rect::from_min_size(pos2(rect.min.x + 2.0 + x * seg, rect.min.y + 2.0), vec2(seg - 4.0, h - 4.0));
     p.rect_filled(hl.translate(vec2(0.0, 1.0)), 7.0, black(0.25));
-    p.rect_filled(hl, 7.0, Color32::from_rgb(99, 99, 102));
+    p.add(glass_shape_with(hl, 8.0, Color32::from_white_alpha(70), Color32::from_white_alpha(48), 70.0));
     let mut out = None;
     for (i, (v, label)) in options.iter().enumerate() {
         let r = Rect::from_min_size(pos2(rect.min.x + i as f32 * seg, rect.min.y), vec2(seg, h));
@@ -1697,7 +1791,8 @@ fn round_button(ui: &mut Ui, g: Glyph) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     let p = ui.painter();
-    p.circle_filled(rect.center(), 18.0, if resp.is_pointer_button_down_on() { RAISED } else if resp.hovered() { Color32::from_rgb(38, 38, 40) } else { GROUP });
+    let a = if resp.is_pointer_button_down_on() { 2.0 } else if resp.hovered() { 1.5 } else { 1.0 };
+    p.add(glass_shape_with(Rect::from_center_size(rect.center(), vec2(36.0, 36.0)), 18.0, Color32::from_white_alpha((24.0 * a) as u8), Color32::from_white_alpha((12.0 * a) as u8), 50.0));
     glyph(p, rect.center(), g, if resp.hovered() { TEXT } else { DIM }, 1.0);
     resp
 }
@@ -1733,14 +1828,12 @@ fn notify(text: &str) {
 
 /// Notification-style card shown inside the lagless window.
 fn alert_banner(ui: &mut Ui, text: &str) {
-    egui::Frame::new()
-        .fill(RAISED)
-        .corner_radius(CornerRadius::same(18))
-        .inner_margin(egui::Margin::symmetric(12, 10))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            alert_content(ui, text);
-        });
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let shown = egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        alert_content(ui, text);
+    });
+    ui.painter().set(bg, glass_shape_with(shown.response.rect, 18.0, BAD.gamma_multiply(0.22), Color32::from_white_alpha(14), 60.0));
 }
 
 fn alert_content(ui: &mut Ui, text: &str) {
@@ -1820,6 +1913,7 @@ enum Glyph {
     Info,
     Waves,
     Sliders,
+    Sparkle,
 }
 
 fn device_glyph(name: &str) -> Glyph {
@@ -1928,6 +2022,9 @@ fn glyph(p: &egui::Painter, c: Pos2, g: Glyph, col: Color32, s: f32) {
                 p.line_segment([v(x, -h / 2.0), v(x, h / 2.0)], Stroke::new(1.9 * s, col));
             }
         }
+        Glyph::Sparkle => {
+            p.add(egui::Shape::convex_polygon(vec![v(0.0, -8.0), v(1.8, -1.8), v(8.0, 0.0), v(1.8, 1.8), v(0.0, 8.0), v(-1.8, 1.8), v(-8.0, 0.0), v(-1.8, -1.8)], col, Stroke::NONE));
+        }
         Glyph::Sliders => {
             for (k, knob) in [0.3f32, 0.7, 0.45].iter().enumerate() {
                 let y = -5.5 + k as f32 * 5.5;
@@ -1957,6 +2054,10 @@ pub fn run() -> eframe::Result<()> {
             .with_title("lagless")
             .with_inner_size([400.0, 680.0])
             .with_min_inner_size([360.0, 480.0])
+            .with_transparent(Settings::load().glass && cfg!(any(target_os = "macos", windows)))
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false)
             .with_icon(Arc::new(app_icon())),
         ..Default::default()
     };
