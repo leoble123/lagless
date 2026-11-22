@@ -40,6 +40,87 @@ fn with_env<T>(f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<T>) 
     Ok(r?)
 }
 
+// ---------------------------------------------------------------- startup watchdog
+//
+// An Android app that stops processing events for ~5 s gets "App not responding" and nothing
+// else. To find out where lagless gets stuck, the UI thread leaves breadcrumbs and a watchdog
+// thread reports a stall (step + this app's own recent log lines) on the crash screen.
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::Mutex;
+
+static STEP: Mutex<&'static str> = Mutex::new("starting");
+static STARTED: OnceLock<std::time::Instant> = OnceLock::new();
+static FRAME_START_MS: AtomicU64 = AtomicU64::new(0);
+static IN_FRAME: AtomicBool = AtomicBool::new(false);
+static FRAMES: AtomicU64 = AtomicU64::new(0);
+static REPORTED: AtomicBool = AtomicBool::new(false);
+
+fn now_ms() -> u64 {
+    STARTED.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// Breadcrumb: what the UI thread is doing right now.
+pub fn step(s: &'static str) {
+    *STEP.lock().unwrap() = s;
+    log(&format!("step: {s}"));
+}
+
+pub fn frame_begin() {
+    FRAME_START_MS.store(now_ms(), Relaxed);
+    IN_FRAME.store(true, Relaxed);
+}
+
+pub fn frame_end() {
+    IN_FRAME.store(false, Relaxed);
+    if FRAMES.fetch_add(1, Relaxed) == 0 {
+        step("first frame done");
+    }
+}
+
+/// Watch for the UI thread getting stuck: no first frame within 8 s, or a frame taking 4 s.
+pub fn start_watchdog() {
+    now_ms();
+    let _ = std::thread::Builder::new().name("watchdog".into()).spawn(|| loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let t = now_ms();
+        let stuck_in_frame = IN_FRAME.load(Relaxed) && t.saturating_sub(FRAME_START_MS.load(Relaxed)) > 4_000;
+        let no_first_frame = FRAMES.load(Relaxed) == 0 && t > 8_000;
+        if (stuck_in_frame || no_first_frame) && !REPORTED.swap(true, Relaxed) {
+            let what = if stuck_in_frame { "stuck inside a frame" } else { "no first frame after 8 s" };
+            let step = *STEP.lock().unwrap();
+            show_crash(&format!(
+                "lagless {} on {}\n\nThe app froze ({what}).\nLast step: {step}\nFrames drawn: {}\nTime since start: {:.1} s\n\nRecent log:\n{}",
+                crate::update::VERSION,
+                device_name().unwrap_or_default(),
+                FRAMES.load(Relaxed),
+                t as f64 / 1000.0,
+                own_log()
+            ));
+        }
+    });
+}
+
+/// This app's own recent logcat lines (apps may read their own logs without any permission).
+pub fn own_log() -> String {
+    let pid = std::process::id().to_string();
+    std::process::Command::new("logcat")
+        .args(["-d", "-t", "150", "--pid", &pid])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_else(|e| format!("(couldn't read log: {e})"))
+}
+
+/// Do Java calls off the UI thread, so the UI thread can never end up waiting on Android's
+/// main thread while Android's main thread waits on it.
+pub fn in_background(name: &'static str, f: impl FnOnce() -> anyhow::Result<()> + Send + 'static) {
+    let _ = std::thread::Builder::new().name(name.into()).spawn(move || {
+        if let Err(e) = f() {
+            log(&format!("{name}: {e}"));
+        }
+    });
+}
+
 /// Write a line to logcat (tag "lagless").
 pub fn log(msg: &str) {
     extern "C" {

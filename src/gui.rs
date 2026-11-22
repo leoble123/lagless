@@ -387,18 +387,22 @@ pub struct App {
 impl App {
     fn new(cc: &eframe::CreationContext) -> Self {
         style(&cc.egui_ctx);
+        crumb("App::new: style");
         let mut settings = Settings::load();
         if cfg!(target_os = "android") {
             settings.mode = Mode::Receive;
             settings.aware = false;
         }
+        crumb("App::new: engine");
         let engine = Engine::start(&settings, cc.egui_ctx.clone());
         let (mic, mic_problem) = match Engine::start_mic(&settings, cc.egui_ctx.clone()) {
             Ok(m) => (m, None),
             Err(e) => (None, Some(e)),
         };
         let wake = cc.egui_ctx.clone();
+        crumb("App::new: control api");
         let control = Control::start(settings_path().and_then(|p| p.parent().map(|d| d.to_path_buf())), move || wake.request_repaint());
+        crumb("App::new: listener");
         let listener = start_listener(&settings, &cc.egui_ctx);
         App {
             control,
@@ -407,7 +411,10 @@ impl App {
             alert: None,
             fonts_warm: false,
             draft: settings.clone(),
-            updater: Updater::start(settings.auto_update),
+            updater: {
+                crumb("App::new: updater");
+                Updater::start(settings.auto_update)
+            },
             unmute_to: if settings.volume > 0.0 { settings.volume } else { 0.5 },
             settings,
             engine,
@@ -574,16 +581,18 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "android")]
+        crate::android::frame_begin();
         let ctx = ui.ctx().clone();
         if !self.fonts_warm {
+            crumb("first frame: fonts");
             warm_fonts(&ctx);
+            crumb("first frame: drawing");
             self.fonts_warm = true;
             #[cfg(target_os = "android")]
             {
-                let _ = crate::android::request_notification_permission();
-                if let Err(e) = crate::android::start_foreground_service() {
-                    crate::android::log(&format!("foreground service: {e}"));
-                }
+                crate::android::in_background("notify-perm", crate::android::request_notification_permission);
+                crate::android::in_background("playback-service", crate::android::start_foreground_service);
             }
         }
         let now = ctx.input(|i| i.time);
@@ -628,6 +637,8 @@ impl eframe::App for App {
 
         // Nothing animates, so a few frames a second is plenty for live numbers.
         ctx.request_repaint_after(Duration::from_millis(250));
+        #[cfg(target_os = "android")]
+        crate::android::frame_end();
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1215,6 +1226,12 @@ fn segmented(ui: &mut Ui, mode: Mode) -> Option<Mode> {
 
 const ALERT_SECS: f64 = 6.0;
 
+/// Startup breadcrumb (Android watchdog); nothing elsewhere.
+fn crumb(_s: &'static str) {
+    #[cfg(target_os = "android")]
+    crate::android::step(_s);
+}
+
 fn start_listener(s: &Settings, ctx: &egui::Context) -> Option<crate::aware::Listener> {
     if s.mode != Mode::Receive || !s.aware {
         return None;
@@ -1430,10 +1447,11 @@ pub fn run_android(app: winit::platform::android::activity::AndroidApp) -> efram
         // SAFETY: called first thing on the main thread, before any other threads exist.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir) };
     }
+    crate::android::start_watchdog();
+    crate::android::step("android_main: activity ref");
     crate::android::set_activity(app.activity_as_ptr());
-    if let Err(e) = crate::android::keep_network_fast() {
-        crate::android::log(&format!("network locks: {e}"));
-    }
+    crate::android::in_background("network-locks", crate::android::keep_network_fast);
+    crate::android::step("android_main: starting event loop");
     // The notification permission and the playback service wait for the first frame: Android 12+
     // only lets an app start a foreground service once its window is actually showing.
     let opts = eframe::NativeOptions { android_app: Some(app), ..Default::default() };
