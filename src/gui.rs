@@ -102,8 +102,6 @@ pub struct Settings {
     /// Volume slider position, 0..1 (see `Volume::slider_to_gain`).
     pub volume: f32,
     pub auto_update: bool,
-    /// See-through, blurred window background (macOS vibrancy / Windows 11 Mica).
-    pub glass: bool,
 }
 
 impl Default for Settings {
@@ -139,7 +137,6 @@ impl Default for Settings {
             aware_notify: true,
             volume: 1.0,
             auto_update: true,
-            glass: true,
         }
     }
 }
@@ -396,8 +393,6 @@ pub struct App {
     alert: Option<(String, f64)>,
     fonts_warm: bool,
     details_open: bool,
-    /// The window really is see-through (the OS accepted the blur).
-    glass_on: bool,
 }
 
 impl App {
@@ -416,7 +411,6 @@ impl App {
         let wake = cc.egui_ctx.clone();
         let control = Control::start(settings_path().and_then(|p| p.parent().map(|d| d.to_path_buf())), move || wake.request_repaint());
         let listener = start_listener(&settings, &cc.egui_ctx);
-        let glass_on = settings.glass && apply_glass(cc);
         App {
             control,
             paused: false,
@@ -424,7 +418,6 @@ impl App {
             alert: None,
             fonts_warm: false,
             details_open: false,
-            glass_on,
             draft: settings.clone(),
             updater: Updater::start(settings.auto_update),
             unmute_to: if settings.volume > 0.0 { settings.volume } else { 0.5 },
@@ -601,8 +594,7 @@ impl eframe::App for App {
         let now = ctx.input(|i| i.time);
         self.tick(now);
 
-        let fill = if self.glass_on { black(0.32) } else { BG };
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(fill)).show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| {
             let full = ui.max_rect();
             ambient(ui.painter(), full);
             // Settings is a page pushed in from the right, iOS style; the main page slides a
@@ -651,11 +643,7 @@ impl eframe::App for App {
     }
 
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
-        if self.glass_on {
-            [0.0; 4]
-        } else {
-            BG.to_normalized_gamma_f32()
-        }
+        BG.to_normalized_gamma_f32()
     }
 }
 
@@ -1259,12 +1247,6 @@ impl App {
                 }
             }
         }
-        if cfg!(any(target_os = "macos", windows)) {
-            let note = if cfg!(windows) { "Your wallpaper tints the window (Windows 11). Applies the next time lagless opens." } else { "Your desktop shows through, blurred. Applies the next time lagless opens." };
-            group(ui, "Appearance", note, |ui| {
-                row(ui, Some((Glyph::Sparkle, PURPLE)), "Glass window", TEXT, None, Trail::Switch(&mut d.glass));
-            });
-        }
         group(ui, "Updates", "", |ui| {
             row(ui, Some((Glyph::Download, GRAY)), "Update automatically", TEXT, None, Trail::Switch(&mut d.auto_update));
             let state = match self.updater.state() {
@@ -1586,24 +1568,6 @@ fn ambient(p: &egui::Painter, full: Rect) {
     glow(p, pos2(full.right() - 40.0, full.top() + 40.0), 200.0, TEAL.gamma_multiply(0.14));
 }
 
-/// Real see-through window where the OS offers one; false (opaque window) otherwise.
-fn apply_glass(cc: &eframe::CreationContext) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial, NSVisualEffectState};
-        return apply_vibrancy(cc, NSVisualEffectMaterial::HudWindow, Some(NSVisualEffectState::Active), None).is_ok();
-    }
-    #[cfg(windows)]
-    {
-        return window_vibrancy::apply_mica(cc, Some(true)).is_ok();
-    }
-    #[allow(unreachable_code)]
-    {
-        let _ = cc;
-        false
-    }
-}
-
 /// macOS draws the traffic lights over our content (transparent title bar).
 const TOP_INSET: f32 = if cfg!(target_os = "macos") { 28.0 } else { 0.0 };
 
@@ -1913,7 +1877,6 @@ enum Glyph {
     Info,
     Waves,
     Sliders,
-    Sparkle,
 }
 
 fn device_glyph(name: &str) -> Glyph {
@@ -2022,9 +1985,6 @@ fn glyph(p: &egui::Painter, c: Pos2, g: Glyph, col: Color32, s: f32) {
                 p.line_segment([v(x, -h / 2.0), v(x, h / 2.0)], Stroke::new(1.9 * s, col));
             }
         }
-        Glyph::Sparkle => {
-            p.add(egui::Shape::convex_polygon(vec![v(0.0, -8.0), v(1.8, -1.8), v(8.0, 0.0), v(1.8, 1.8), v(0.0, 8.0), v(-1.8, 1.8), v(-8.0, 0.0), v(-1.8, -1.8)], col, Stroke::NONE));
-        }
         Glyph::Sliders => {
             for (k, knob) in [0.3f32, 0.7, 0.45].iter().enumerate() {
                 let y = -5.5 + k as f32 * 5.5;
@@ -2054,7 +2014,6 @@ pub fn run() -> eframe::Result<()> {
             .with_title("lagless")
             .with_inner_size([400.0, 680.0])
             .with_min_inner_size([360.0, 480.0])
-            .with_transparent(Settings::load().glass && cfg!(any(target_os = "macos", windows)))
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
             .with_title_shown(false)

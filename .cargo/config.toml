@@ -1,3 +1,6 @@
 # Android 15+ devices may use 16 KB memory pages; libraries aligned only for 4 KB won't load there.
 [target.aarch64-linux-android]
-rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+# Oboe (C++) links libc++ statically, but the C++ ABI runtime (__cxa_*, operator new/delete,
+# exceptions) lives in a separate archive that nothing pulls in; without it the library builds
+# fine and then fails to load on the phone ("cannot locate symbol __cxa_pure_virtual").
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384", "-C", "link-arg=-lc++abi"]
