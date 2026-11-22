@@ -173,6 +173,10 @@ pub struct Shared {
     pub sync: AtomicBool,
     /// Output (receiver) or stream (sender) volume, live from the UI.
     pub volume: Arc<crate::playout::Volume>,
+    /// Sender: the latest game-stats packet to pass to every device. Receiver: stats packets
+    /// that arrived (JSON, perf.rs), in order, since the UI last looked.
+    perf_out: Mutex<Option<Vec<u8>>>,
+    perf_in: Mutex<Vec<Vec<u8>>>,
 }
 
 impl Shared {
@@ -241,6 +245,28 @@ impl Shared {
 
     pub fn take_alerts(&self) -> Vec<String> {
         std::mem::take(&mut *self.alerts_in.lock().unwrap())
+    }
+
+    pub fn send_perf(&self, json: Vec<u8>) {
+        *self.perf_out.lock().unwrap() = Some(json);
+    }
+
+    pub fn take_outgoing_perf(&self) -> Option<Vec<u8>> {
+        self.perf_out.lock().unwrap().take()
+    }
+
+    pub fn perf_arrived(&self, json: Vec<u8>) {
+        let mut q = self.perf_in.lock().unwrap();
+        q.push(json);
+        if q.len() > 64 {
+            q.remove(0);
+        }
+        drop(q);
+        self.wake();
+    }
+
+    pub fn take_perf(&self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut *self.perf_in.lock().unwrap())
     }
 
     pub fn take_levels(&self) -> [f32; 2] {

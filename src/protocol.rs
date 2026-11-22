@@ -19,6 +19,8 @@ pub const MAGIC_PROBE: &[u8; 4] = b"LGLD";
 /// Receiver -> sender: "heard something in the room" (sound awareness). Sent a few times;
 /// the id lets the sender show it once.
 pub const MAGIC_ALERT: &[u8; 4] = b"LGLE";
+/// PC -> receivers: game performance stats (JSON, see perf.rs), a few times a second.
+pub const MAGIC_PERF: &[u8; 4] = b"LGLF";
 
 /// Frame flag: first frame after the capture source went quiet (not a network glitch).
 pub const FLAG_DISCONT: u8 = 1;
@@ -276,6 +278,17 @@ pub fn parse_alert(buf: &[u8]) -> Option<(u32, String)> {
     }
     let t = buf.get(9..9 + buf[8] as usize)?;
     Some((u32_at(buf, 4), String::from_utf8_lossy(t).into_owned()))
+}
+
+pub fn write_perf(json: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(4 + json.len());
+    v.extend_from_slice(MAGIC_PERF);
+    v.extend_from_slice(&json[..json.len().min(MAX_PACKET - 4)]);
+    v
+}
+
+pub fn parse_perf(buf: &[u8]) -> Option<&[u8]> {
+    (buf.len() > 4 && &buf[0..4] == MAGIC_PERF).then(|| &buf[4..])
 }
 
 fn u32_at(b: &[u8], i: usize) -> u32 {

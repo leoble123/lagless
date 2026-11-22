@@ -15,6 +15,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+#[path = "gui_perf.rs"]
+mod perf_ui;
+
 // ------------------------------------------------------------------ palette
 
 const BG: Color32 = Color32::from_rgb(0, 0, 0);
@@ -99,6 +102,13 @@ pub struct Settings {
     pub aware_pc: bool,
     /// Also post a macOS notification.
     pub aware_notify: bool,
+    /// PC: FPS/GPU/CPU stats (perf.rs), shown here and sent to the Mac.
+    pub perf_stats: bool,
+    /// PC: small click-through counter over the game, and which corner (0 TL, 1 TR, 2 BL, 3 BR).
+    pub perf_osd: bool,
+    pub perf_osd_corner: u8,
+    /// Mac: show the PC's game stats.
+    pub perf_show: bool,
     /// Volume slider position, 0..1 (see `Volume::slider_to_gain`).
     pub volume: f32,
     pub auto_update: bool,
@@ -135,6 +145,10 @@ impl Default for Settings {
             aware_hear: true,
             aware_pc: true,
             aware_notify: true,
+            perf_stats: true,
+            perf_osd: false,
+            perf_osd_corner: 0,
+            perf_show: true,
             volume: 1.0,
             auto_update: true,
         }
@@ -393,6 +407,8 @@ pub struct App {
     alert: Option<(String, f64)>,
     fonts_warm: bool,
     details_open: bool,
+    perf: Option<crate::perf::Monitor>,
+    perf_view: perf_ui::PerfView,
     /// Last time the stream had audible sound in it (to point out a silent stream).
     last_sound: f64,
 }
@@ -413,6 +429,10 @@ impl App {
         let wake = cc.egui_ctx.clone();
         let control = Control::start(settings_path().and_then(|p| p.parent().map(|d| d.to_path_buf())), move || wake.request_repaint());
         let listener = start_listener(&settings, &cc.egui_ctx);
+        let perf = (settings.mode == Mode::Send && settings.perf_stats).then(|| {
+            let wake = cc.egui_ctx.clone();
+            crate::perf::Monitor::start(move || wake.request_repaint())
+        });
         App {
             control,
             paused: false,
@@ -420,6 +440,8 @@ impl App {
             alert: None,
             fonts_warm: false,
             details_open: false,
+            perf,
+            perf_view: Default::default(),
             last_sound: 0.0,
             draft: settings.clone(),
             updater: Updater::start(settings.auto_update),
@@ -446,6 +468,7 @@ impl App {
         self.engine = Engine::start(&self.settings, ctx.clone());
         self.restart_mic(ctx);
         self.restart_listener(ctx);
+        self.restart_perf(ctx);
     }
 
     fn restart_listener(&mut self, ctx: &egui::Context) {
@@ -585,6 +608,7 @@ impl eframe::App for App {
     /// API wakes it), so other apps' commands apply even if nobody is looking at the window.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_alerts(ctx);
+        self.pump_perf(ctx);
         let Some(control) = self.control.clone() else { return };
         for cmd in control.take_commands() {
             self.apply_command(cmd, ctx);
@@ -678,6 +702,7 @@ impl App {
                 ui.add_space(12.0);
                 self.volume_card(ui);
                 ui.add_space(22.0);
+                self.perf_card(ui, ctx);
                 group(ui, "", "", |ui| {
                     self.mic_rows(ui, ctx);
                     if self.settings.mode == Mode::Receive {
@@ -1267,6 +1292,7 @@ impl App {
                 }
             }
         }
+        App::perf_settings(d, ui);
         group(ui, "Updates", "", |ui| {
             row(ui, Some((Glyph::Download, GRAY)), "Update automatically", TEXT, None, Trail::Switch(&mut d.auto_update));
             let state = match self.updater.state() {
@@ -1897,6 +1923,7 @@ enum Glyph {
     Info,
     Waves,
     Sliders,
+    Gauge,
 }
 
 fn device_glyph(name: &str) -> Glyph {
@@ -2004,6 +2031,11 @@ fn glyph(p: &egui::Painter, c: Pos2, g: Glyph, col: Color32, s: f32) {
             for (x, h) in [(-6.0f32, 3.0f32), (-3.0, 7.0), (0.0, 10.0), (3.0, 6.0), (6.0, 3.5)] {
                 p.line_segment([v(x, -h / 2.0), v(x, h / 2.0)], Stroke::new(1.9 * s, col));
             }
+        }
+        Glyph::Gauge => {
+            p.add(arc(v(0.0, 3.0), 7.5, PI, 2.0 * PI));
+            p.line_segment([v(0.0, 3.0), v(4.2, -2.6)], Stroke::new(1.9 * s, col));
+            p.circle_filled(v(0.0, 3.0), 1.8 * s, col);
         }
         Glyph::Sliders => {
             for (k, knob) in [0.3f32, 0.7, 0.45].iter().enumerate() {

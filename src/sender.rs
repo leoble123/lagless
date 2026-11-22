@@ -522,6 +522,16 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
             }
         }
 
+        // Game stats (perf.rs) for every device, as soon as the UI has a fresh set.
+        if let Some(json) = sh.take_outgoing_perf() {
+            let pkt = protocol::write_perf(&json);
+            for p in peers.values() {
+                if let Some(dst) = p.current {
+                    let _ = sock.send_to(&pkt, dst);
+                }
+            }
+        }
+
         // Once a second: who we are, each device's share of the latency, and (sync mode) how
         // much each device should wait so they all play together.
         if last_info.elapsed() >= Duration::from_secs(1) {

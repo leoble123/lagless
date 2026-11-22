@@ -91,6 +91,28 @@ Send `Authorization: Bearer <token>` with each request:
 
 Commands apply even while the window is minimized.
 
+## Game stats (FPS, frame times, GPU, CPU)
+
+The PC measures the game you're playing and shows it on the Mac (a second screen, so nothing
+covers the game) and, if you like, in a small click-through counter over the game.
+
+- **FPS, 1% and 0.1% lows, frame time**, plus a live frame-time graph with stutters marked.
+- **What's limiting you**: GPU-limited (lower graphics settings), CPU-limited (graphics settings
+  won't help), or capped (you're at your frame cap / V-Sync).
+- **Why it stuttered**: each hitch gets a likely cause, e.g. a background app using CPU, VRAM
+  full, or the GPU slowing down because it's too hot.
+- **NVIDIA GPU**: load, temperature, clock, power vs. limit, VRAM, and throttling.
+- **CPU** (total and busiest core) and **RAM**.
+
+Nothing touches the game: frame timing comes from Windows' own event tracing (the same data
+PresentMon uses) and GPU numbers from NVIDIA's driver, so there's nothing for anti-cheat to see.
+Windows only lets admins read frame timing; the first time, lagless shows **Allow the FPS
+counter** (one admin prompt, then sign out of Windows and back in once).
+
+Turn it on or off, and pick the on-screen display and its corner, in Settings → Game stats on the
+PC; on the Mac, Settings → PC performance. The on-screen display shows over games in windowed
+fullscreen (borderless), not exclusive fullscreen.
+
 ## Sound alerts (hear the room with your IEMs in)
 
 With IEMs in, you can miss the doorbell, someone knocking or a smoke alarm. Turn on **Sound alerts** on the Mac and lagless listens to the room through the Mac's mic. When it hears something that matters:

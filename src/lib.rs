@@ -13,6 +13,8 @@ pub mod engine;
 pub mod gui;
 pub mod mic_access;
 pub mod net;
+#[cfg(not(target_os = "android"))]
+pub mod perf;
 pub mod playout;
 pub mod protocol;
 pub mod receiver;

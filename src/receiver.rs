@@ -91,6 +91,8 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
                     let _ = sock.send_to(&my_beacon, src);
                 } else if let Some(t) = protocol::parse_ping(protocol::MAGIC_PING, pkt) {
                     let _ = sock.send_to(&protocol::write_ping(protocol::MAGIC_PONG, t), src);
+                } else if let Some(json) = protocol::parse_perf(pkt) {
+                    sh.perf_arrived(json.to_vec());
                 } else if let Some(info) = protocol::parse_info(pkt) {
                     if let Some(s) = session.as_mut().filter(|s| s.header.stream_id == info.stream_id) {
                         s.stats.sync_us.store(info.sync_delay_us.min(500_000), Relaxed);
