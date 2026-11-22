@@ -2,7 +2,7 @@
 
 use crate::audio;
 use crate::codec::Encoder;
-use crate::engine::{LinkKind, Phase, Shared};
+use crate::engine::{LinkKind, PeerStatus, Phase, Shared};
 use crate::net;
 use crate::protocol::{self, AudioHeader, Codec, Info, Report, FLAG_DISCONT, FLAG_REDUNDANT, MAX_PACKET};
 use anyhow::{anyhow, Context, Result};
@@ -54,6 +54,10 @@ pub struct Options {
     pub engine_boost: bool,
     /// Mic link: mono, noise-suppressed, leveled speech (see voice.rs).
     pub voice_focus: bool,
+    /// Receiver names not to stream to.
+    pub exclude: Vec<String>,
+    /// Make every device play at the same delay (the slowest one's), e.g. speakers in one room.
+    pub sync: bool,
     pub tone_rate: u32,
 }
 
@@ -148,73 +152,75 @@ impl Path {
     }
 }
 
-/// Picks the receiver and, among every address it is reachable on, the one with the lowest RTT.
-struct Router {
-    fixed: Option<SocketAddr>,
-    port: u16,
-    want_name: Option<String>,
-    dir: Option<net::Directory>,
-    receiver: Option<(u64, String)>,
-    paths: HashMap<SocketAddr, Path>,
-    current: Option<SocketAddr>,
-    sh: Arc<Shared>,
+/// Quality lanes: each is encoded once and fanned out to every device on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lane {
+    /// Uncompressed PCM (24- or 16-bit): lowest latency, ~2-5 Mbit/s per device.
+    Lossless,
+    /// Opus with heavier FEC: ~1 Mbit/s per device, for lossy links or crowds.
+    Compact,
 }
 
-impl Router {
-    fn candidates(&mut self) -> Vec<SocketAddr> {
-        if let Some(a) = self.fixed {
-            return vec![a];
+/// Lossless for up to this many devices; beyond it new devices start on Opus so a shared Wi-Fi
+/// network doesn't drown (each device still moves up/down on its own loss).
+const LOSSLESS_CROWD: usize = 5;
+
+/// One device we stream to.
+struct Peer {
+    name: String,
+    /// The receiver's addresses we've heard of (one per network link it's reachable on).
+    paths: HashMap<SocketAddr, Path>,
+    current: Option<SocketAddr>,
+    /// --to: we send even if pings are blocked.
+    fixed: bool,
+    lane: Lane,
+    last_report: Option<Report>,
+    loss_pct: f64,
+    bad: u32,
+    good: u32,
+    last_heard: Instant,
+    /// Latency without any sync delay, ms (for sync mode).
+    base_latency_ms: f64,
+    /// Extra delay we ask this device to add in sync mode, µs.
+    sync_us: u32,
+}
+
+impl Peer {
+    fn new(name: String, lane: Lane) -> Self {
+        Peer {
+            name,
+            paths: HashMap::new(),
+            current: None,
+            fixed: false,
+            lane,
+            last_report: None,
+            loss_pct: 0.0,
+            bad: 0,
+            good: 0,
+            last_heard: Instant::now(),
+            base_latency_ms: 0.0,
+            sync_us: 0,
         }
-        let Some(dir) = &self.dir else { return vec![] };
-        let dir = dir.lock().unwrap();
-        if self.receiver.is_none() {
-            let port = self.port;
-            let mut found: Vec<_> = dir
-                .iter()
-                .filter(|(_, s)| s.addrs.keys().any(|a| a.port() == port))
-                .filter(|(_, s)| self.want_name.as_ref().map_or(true, |w| s.name.to_lowercase().contains(&w.to_lowercase())))
-                .collect();
-            found.sort_by_key(|(_, s)| s.first_seen);
-            if let Some((id, s)) = found.first() {
-                if found.len() > 1 && self.want_name.is_none() {
-                    let names: Vec<_> = found.iter().map(|(_, s)| s.name.as_str()).collect();
-                    self.sh.event(format!("Several receivers found {names:?}; using \"{}\"", s.name));
-                }
-                self.receiver = Some((**id, s.name.clone()));
-            }
-        }
-        let Some((id, _)) = &self.receiver else { return vec![] };
-        dir.get(id)
-            .map(|s| {
-                s.addrs
-                    .iter()
-                    .filter(|(a, t)| a.port() == self.port && t.elapsed() < Duration::from_secs(5))
-                    .map(|(a, _)| *a)
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
-    fn reselect(&mut self) {
-        let best = self
-            .paths
-            .iter()
-            .filter_map(|(a, p)| p.score().map(|s| (*a, s)))
-            .min_by(|a, b| a.1.total_cmp(&b.1));
+    fn rtt(&self) -> f64 {
+        self.current.and_then(|c| self.paths.get(&c)).and_then(Path::score).unwrap_or(0.0)
+    }
+
+    /// Pick the lowest-RTT path; only hop for a clear win so two similar links don't flap.
+    fn reselect(&mut self, sh: &Shared) {
+        let best = self.paths.iter().filter_map(|(a, p)| p.score().map(|s| (*a, s))).min_by(|a, b| a.1.total_cmp(&b.1));
         let cur_score = self.current.and_then(|c| self.paths.get(&c)).and_then(Path::score);
         let switch = match (best, cur_score) {
             (Some((b, _)), _) if self.current.is_none() => Some(b),
-            (Some((b, _)), None) if Some(b) != self.current => Some(b),
-            // Only hop for a clear win, so two similar links don't flap.
+            (Some((b, _)), None) if Some(b) != self.current && !self.fixed => Some(b),
             (Some((b, s)), Some(c)) if s + 0.3 < c && s < c * 0.7 => Some(b),
             _ => None,
         };
         if let Some(b) = switch {
             let rtt = self.paths[&b].score().unwrap_or(0.0);
-            self.sh.event(format!("Connected via {} ({}, round trip {:.2} ms)", net::route_name(b.ip()), b.ip(), rtt));
+            sh.event(format!("{}: connected via {} ({}, round trip {:.2} ms)", self.name, net::route_name(b.ip()), b.ip(), rtt));
             self.current = Some(b);
-        } else if self.current.is_none() && self.fixed.is_some() {
-            self.current = self.fixed; // send even if pings are firewalled
         }
     }
 
@@ -228,6 +234,36 @@ impl Router {
             .filter_map(|(a, p)| p.score().map(|s| (*a, s)))
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(a, _)| a)
+    }
+
+    fn live(&self) -> bool {
+        self.current.is_some() && (self.fixed || self.last_heard.elapsed() < Duration::from_secs(10))
+    }
+}
+
+/// An encoder, its own stream id/sequence, and the recent frames for FEC.
+struct LaneTx {
+    enc: Encoder,
+    stream_id: u32,
+    seq: u32,
+    redundancy: usize,
+    history: VecDeque<(u32, u8, Vec<u8>)>,
+    /// Samples waiting for a full frame (Opus frames are longer than capture frames).
+    pending: Vec<f32>,
+    pending_flags: u8,
+}
+
+impl LaneTx {
+    fn new(codec: Codec, rate: u32, ch: usize, kbps: u32, redundancy: usize) -> Result<Self> {
+        Ok(LaneTx {
+            enc: Encoder::new(codec, rate, ch, kbps)?,
+            stream_id: net::random_u64() as u32,
+            seq: 0,
+            redundancy,
+            history: VecDeque::new(),
+            pending: Vec::new(),
+            pending_flags: 0,
+        })
     }
 }
 
@@ -244,6 +280,8 @@ fn aligned_frame(chunk: usize, want: usize, max: usize) -> usize {
 }
 
 pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
+    *sh.exclude.lock().unwrap() = o.exclude.clone();
+    sh.sync.store(o.sync, Relaxed);
     crate::boost::process();
     crate::boost::thread();
     // Speed up the Windows audio engine *before* capture opens, so loopback starts in small chunks.
@@ -270,32 +308,34 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
     // Voice focus works on one channel: a mic is mono anyway, and it halves the bandwidth.
     let wire_ch = if voice.is_some() { 1 } else { cap.channels.min(2) };
     let rate = cap.rate;
-    let stream_id = net::random_u64() as u32;
+    let opus_ok = rate == 48_000 && cfg!(feature = "opus");
 
-    let start_codec = match o.codec {
-        CodecChoice::Auto | CodecChoice::Pcm24 => Codec::Pcm24,
+    let lossless_codec = match o.codec {
         CodecChoice::Pcm16 => Codec::Pcm16,
-        CodecChoice::Opus => Codec::Opus,
+        CodecChoice::Opus if opus_ok => Codec::Opus,
+        _ => Codec::Pcm24,
     };
-    let mut enc = Encoder::new(start_codec, rate, wire_ch, o.bitrate_kbps)?;
-    let mut redundancy = o.redundancy;
+    let mut lossless = LaneTx::new(lossless_codec, rate, wire_ch, o.bitrate_kbps, o.redundancy)?;
+    let mut compact: Option<LaneTx> = None;
 
     let sock = net::udp_socket(0, false, false)?;
     sock.set_nonblocking(true)?;
-    let fixed = match &o.to {
-        Some(t) => {
-            let with_port = if t.contains(':') { t.clone() } else { format!("{t}:{}", o.port) };
-            Some(with_port.to_socket_addrs()?.find(|a| a.is_ipv4()).ok_or_else(|| anyhow!("can't resolve {t}"))?)
-        }
-        None => None,
-    };
-    let dir = if fixed.is_none() {
-        let d = net::spawn_listener().context("Can't listen for receivers (enter the Mac's IP address instead)")?;
-        Some(d)
+    let mut peers: HashMap<u64, Peer> = HashMap::new();
+    if let Some(t) = &o.to {
+        let with_port = if t.contains(':') { t.clone() } else { format!("{t}:{}", o.port) };
+        let addr = with_port.to_socket_addrs()?.find(|a| a.is_ipv4()).ok_or_else(|| anyhow!("can't resolve {t}"))?;
+        let mut p = Peer::new(addr.ip().to_string(), Lane::Lossless);
+        p.fixed = true;
+        p.current = Some(addr);
+        p.paths.insert(addr, Path::default());
+        peers.insert(0, p);
+    }
+    let dir = if o.to.is_none() {
+        Some(net::spawn_listener().context("Can't listen for receivers (enter the Mac's IP address instead)")?)
     } else {
         None
     };
-    let mut router = Router { fixed, port: o.port, want_name: o.name.clone(), dir, receiver: None, paths: HashMap::new(), current: None, sh: sh.clone() };
+    let want_mic = o.port == protocol::MIC_PORT;
     sh.update(|s| {
         s.phase = Phase::Searching;
         s.device_name = cap.name.clone();
@@ -304,8 +344,6 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
     sh.event(format!("Capturing {} — {} kHz", cap.name, rate as f32 / 1000.0));
 
     let t0 = Instant::now();
-    let mut seq: u32 = 0;
-    let mut history: VecDeque<(u32, u8, Vec<u8>)> = VecDeque::new();
     let mut frame = vec![0f32; 0];
     let mut wire = vec![0f32; 0];
     let mut pkt = Vec::with_capacity(MAX_PACKET);
@@ -314,21 +352,21 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
     let started = Instant::now();
     let mut last_ping = Instant::now() - Duration::from_secs(1);
     let mut last_status = Instant::now();
-    let mut last_report: Option<Report> = None;
-    let mut bad_secs = 0u32;
-    let mut good_secs = 0u32;
-    let mut loss_pct = 0.0;
     let mut last_info = Instant::now();
     let mut seen_alerts: VecDeque<u32> = VecDeque::new();
 
     while !sh.stopped() {
         std::thread::park_timeout(Duration::from_millis(1));
 
-        // --- audio out ---
-        let mut fs = enc.frame_samples(rate, wire_ch, o.frame_ms);
-        if enc.codec() != Codec::Opus {
-            let max = enc.frame_samples(rate, wire_ch, 1000.0); // largest that fits a datagram
+        // --- audio out: encode once per lane, fan out to that lane's devices ---
+        let mut fs = lossless.enc.frame_samples(rate, wire_ch, o.frame_ms);
+        if lossless.enc.codec() != Codec::Opus {
+            let max = lossless.enc.frame_samples(rate, wire_ch, 1000.0); // largest that fits a datagram
             fs = aligned_frame(cap.chunk.load(Relaxed) as usize, fs, max);
+        }
+        let need_compact = peers.values().any(|p| p.lane == Lane::Compact);
+        if need_compact && compact.is_none() && opus_ok {
+            compact = Some(LaneTx::new(Codec::Opus, rate, wire_ch, o.bitrate_kbps, o.redundancy.max(3))?);
         }
         while cap.cons.slots() >= fs * cap.channels {
             let chunk = cap.cons.read_chunk(fs * cap.channels).unwrap();
@@ -355,17 +393,30 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
             }
             last_capture = Instant::now();
 
-            let mut bytes = Vec::new();
-            enc.encode(&wire, &mut bytes)?;
-            history.push_front((seq, flags, bytes));
-            history.truncate(redundancy + 1);
-            seq = seq.wrapping_add(1);
-
-            if let Some(dst) = router.current {
-                let h = AudioHeader { stream_id, codec: enc.codec(), channels: wire_ch as u8, sample_rate: rate };
-                send_frames(&sock, dst, &h, &history, &mut pkt, o.sim_loss);
-                if let Some(b) = router.backup().filter(|_| o.multipath) {
-                    send_frames(&sock, b, &h, &history, &mut pkt, o.sim_loss);
+            for (lane, tx) in [(Lane::Lossless, Some(&mut lossless)), (Lane::Compact, compact.as_mut())] {
+                let Some(tx) = tx else { continue };
+                let targets: Vec<SocketAddr> = peers
+                    .values()
+                    .filter(|p| p.lane == lane && p.live())
+                    .flat_map(|p| p.current.into_iter().chain(p.backup().filter(|_| o.multipath)))
+                    .collect();
+                if targets.is_empty() && lane == Lane::Compact {
+                    continue;
+                }
+                tx.pending.extend_from_slice(&wire);
+                tx.pending_flags |= flags;
+                let tfs = if tx.enc.codec() == Codec::Opus { tx.enc.frame_samples(rate, wire_ch, o.frame_ms) } else { fs };
+                while tx.pending.len() >= tfs * wire_ch {
+                    let samples: Vec<f32> = tx.pending.drain(..tfs * wire_ch).collect();
+                    let mut bytes = Vec::new();
+                    tx.enc.encode(&samples, &mut bytes)?;
+                    tx.history.push_front((tx.seq, std::mem::take(&mut tx.pending_flags), bytes));
+                    tx.history.truncate(tx.redundancy + 1);
+                    tx.seq = tx.seq.wrapping_add(1);
+                    let h = AudioHeader { stream_id: tx.stream_id, codec: tx.enc.codec(), channels: wire_ch as u8, sample_rate: rate };
+                    for dst in &targets {
+                        send_frames(&sock, *dst, &h, &tx.history, &mut pkt, o.sim_loss);
+                    }
                 }
             }
         }
@@ -375,14 +426,18 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
             match sock.recv_from(&mut rbuf) {
                 Ok((n, src)) => {
                     let b = &rbuf[..n];
+                    let peer = peers.values_mut().find(|p| p.paths.contains_key(&src));
                     if let Some(t) = protocol::parse_ping(protocol::MAGIC_PONG, b) {
                         let rtt = (t0.elapsed().as_micros() as u64).saturating_sub(t) as f64 / 1000.0;
-                        let p = router.paths.entry(src).or_default();
-                        p.rtts.push_back(rtt);
-                        if p.rtts.len() > 8 {
-                            p.rtts.pop_front();
+                        if let Some(p) = peer {
+                            let path = p.paths.entry(src).or_default();
+                            path.rtts.push_back(rtt);
+                            if path.rtts.len() > 8 {
+                                path.rtts.pop_front();
+                            }
+                            path.last_pong = Some(Instant::now());
+                            p.last_heard = Instant::now();
                         }
-                        p.last_pong = Some(Instant::now());
                     } else if let Some((id, text)) = protocol::parse_alert(b) {
                         if !seen_alerts.contains(&id) {
                             seen_alerts.push_back(id);
@@ -391,21 +446,23 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
                             }
                             sh.alert_arrived(text);
                         }
-                    } else if let Some(r) = protocol::parse_report(b) {
-                        if r.stream_id != stream_id {
+                    } else if let (Some(r), Some(p)) = (protocol::parse_report(b), peer) {
+                        let lane_id = if p.lane == Lane::Lossless { lossless.stream_id } else { compact.as_ref().map_or(0, |c| c.stream_id) };
+                        if r.stream_id != lane_id {
                             continue;
                         }
-                        if let Some(prev) = last_report {
+                        p.last_heard = Instant::now();
+                        if let Some(prev) = p.last_report.filter(|prev| prev.stream_id == r.stream_id) {
                             let got = r.received.wrapping_sub(prev.received) + r.concealed.wrapping_sub(prev.concealed);
                             let lost = r.concealed.wrapping_sub(prev.concealed);
                             let fixed = r.recovered.wrapping_sub(prev.recovered);
-                            loss_pct = if got > 0 { lost as f64 * 100.0 / got as f64 } else { 0.0 };
+                            p.loss_pct = if got > 0 { lost as f64 * 100.0 / got as f64 } else { 0.0 };
                             let raw_pct = if got > 0 { (lost + fixed) as f64 * 100.0 / got as f64 } else { 0.0 };
-                            if o.codec == CodecChoice::Auto && got > 0 {
-                                adapt(&mut enc, &mut redundancy, &o, rate, wire_ch, loss_pct, raw_pct, &mut bad_secs, &mut good_secs, &sh)?;
+                            if o.codec == CodecChoice::Auto && got > 0 && opus_ok {
+                                adapt(p, raw_pct, &sh);
                             }
                         }
-                        last_report = Some(r);
+                        p.last_report = Some(r);
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -414,33 +471,74 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
             }
         }
 
-        // --- path management ---
+        // --- devices and paths ---
         if last_ping.elapsed() >= Duration::from_millis(500) {
             last_ping = Instant::now();
-            let ping = protocol::write_ping(protocol::MAGIC_PING, t0.elapsed().as_micros() as u64);
-            for a in router.candidates() {
-                let _ = sock.send_to(&ping, a);
+            let exclude = sh.exclude.lock().unwrap().clone();
+            if let Some(dir) = &dir {
+                let dir = dir.lock().unwrap();
+                for (id, seen) in dir.iter().filter(|(_, s)| s.mic == want_mic) {
+                    let wanted = o.name.as_ref().map_or(true, |w| seen.name.to_lowercase().contains(&w.to_lowercase()))
+                        && !exclude.iter().any(|x| x == &seen.name);
+                    let fresh: Vec<SocketAddr> = seen.addrs.iter().filter(|(_, t)| t.elapsed() < Duration::from_secs(5)).map(|(a, _)| *a).collect();
+                    if !wanted || fresh.is_empty() {
+                        continue;
+                    }
+                    let crowd = peers.len() >= LOSSLESS_CROWD && o.codec == CodecChoice::Auto && opus_ok;
+                    let p = peers.entry(*id).or_insert_with(|| Peer::new(seen.name.clone(), if crowd { Lane::Compact } else { Lane::Lossless }));
+                    for a in fresh {
+                        p.paths.entry(a).or_default();
+                    }
+                }
+                // Forget devices that left, were excluded, or stopped answering.
+                peers.retain(|id, p| {
+                    let keep = p.fixed || (dir.get(id).is_some_and(|s| !exclude.iter().any(|x| x == &s.name)) && (p.current.is_none() || p.last_heard.elapsed() < Duration::from_secs(15)));
+                    if !keep {
+                        sh.event(format!("{} left", p.name));
+                    }
+                    keep
+                });
             }
-            router.reselect();
+            let ping = protocol::write_ping(protocol::MAGIC_PING, t0.elapsed().as_micros() as u64);
+            for p in peers.values_mut() {
+                for a in p.paths.keys() {
+                    let _ = sock.send_to(&ping, a);
+                }
+                p.reselect(&sh);
+            }
         }
 
-        // Tell the receiver who we are and our share of the latency, so both ends can show it.
-        if let Some(dst) = router.current.filter(|_| last_info.elapsed() >= Duration::from_secs(1)) {
+        // Once a second: who we are, each device's share of the latency, and (sync mode) how
+        // much each device should wait so they all play together.
+        if last_info.elapsed() >= Duration::from_secs(1) {
             last_info = Instant::now();
-            let rtt = router.paths.get(&dst).and_then(Path::score).unwrap_or(0.0);
-            let info = Info {
-                stream_id,
-                sender_us: ((cap.chunk.load(Relaxed) as f64 / cap.rate as f64 + fs as f64 / rate as f64 + if voice.is_some() { crate::voice::DELAY_SECS } else { 0.0 }) * 1e6) as u32,
-                rtt_us: (rtt * 1000.0) as u32,
-                link: LinkKind::classify(&net::route_name(dst.ip()), dst.ip()).to_u8(),
-                name: my_name.clone(),
-            };
-            let _ = sock.send_to(&protocol::write_info(&info), dst);
+            let sender_ms = (cap.chunk.load(Relaxed) as f64 / cap.rate as f64 + fs as f64 / rate as f64 + if voice.is_some() { crate::voice::DELAY_SECS } else { 0.0 }) * 1000.0;
+            for p in peers.values_mut() {
+                if let Some(r) = p.last_report {
+                    p.base_latency_ms = sender_ms + p.rtt() / 2.0 + r.base_target_us as f64 / 1000.0 + r.device_us as f64 / 1000.0;
+                }
+            }
+            let slowest = peers.values().filter(|p| p.live() && p.last_report.is_some()).map(|p| p.base_latency_ms).fold(0.0, f64::max);
+            for p in peers.values_mut() {
+                p.sync_us = if sh.sync.load(Relaxed) && p.last_report.is_some() { ((slowest - p.base_latency_ms).max(0.0) * 1000.0) as u32 } else { 0 };
+                let Some(dst) = p.current else { continue };
+                let stream_id = if p.lane == Lane::Lossless { lossless.stream_id } else { compact.as_ref().map_or(lossless.stream_id, |c| c.stream_id) };
+                let info = Info {
+                    stream_id,
+                    sender_us: (sender_ms * 1000.0) as u32,
+                    rtt_us: (p.rtt() * 1000.0) as u32,
+                    link: LinkKind::classify(&net::route_name(dst.ip()), dst.ip()).to_u8(),
+                    name: my_name.clone(),
+                    sync_delay_us: p.sync_us,
+                };
+                let _ = sock.send_to(&protocol::write_info(&info), dst);
+            }
         }
 
         if last_status.elapsed() >= Duration::from_millis(250) {
             last_status = Instant::now();
-            publish(&sh, &router, &enc, rate, &cap, fs, loss_pct, last_report.as_ref(), redundancy, last_capture);
+            let codec_of = |l: Lane| if l == Lane::Lossless { lossless.enc.codec() } else { Codec::Opus };
+            publish(&sh, &peers, codec_of, rate, &cap, fs, last_capture, voice.is_some());
             // A device that never delivers a single buffer is almost always a permission problem
             // (macOS gives a denied app silence-by-absence, no error). Say so instead of "idle".
             let never = cap.chunk.load(Relaxed) == 0;
@@ -475,23 +573,21 @@ fn send_frames(sock: &std::net::UdpSocket, dst: SocketAddr, h: &AudioHeader, his
     }
 }
 
-/// Auto mode: stay lossless while the link is clean; fall back to Opus + heavier FEC if it isn't.
-#[allow(clippy::too_many_arguments)]
-fn adapt(enc: &mut Encoder, redundancy: &mut usize, o: &Options, rate: u32, ch: usize, loss_pct: f64, raw_pct: f64, bad: &mut u32, good: &mut u32, sh: &Shared) -> Result<()> {
-    // Going down: audible loss (after FEC). Coming back: the raw link itself must be clean,
-    // otherwise a marginal link would flip back and forth.
-    *bad = if loss_pct > 0.5 { *bad + 1 } else { 0 };
-    *good = if raw_pct < 0.3 { *good + 1 } else { 0 };
-    if enc.codec() != Codec::Opus && *bad >= 3 && rate == 48000 && cfg!(feature = "opus") {
-        *enc = Encoder::new(Codec::Opus, rate, ch, o.bitrate_kbps)?;
-        *redundancy = o.redundancy.max(3);
-        sh.event(format!("Link is dropping {loss_pct:.1}% of audio — switched to Opus {} kbps with extra protection", o.bitrate_kbps));
-    } else if enc.codec() == Codec::Opus && *good >= 30 {
-        *enc = Encoder::new(Codec::Pcm24, rate, ch, o.bitrate_kbps)?;
-        *redundancy = o.redundancy;
-        sh.event("Link is clean again — back to lossless 24-bit");
+/// Auto mode, per device: stay lossless while its link is clean; move it to the Opus lane (with
+/// heavier FEC) if it's losing audio, and back once the raw link is clean for 30 s.
+fn adapt(p: &mut Peer, raw_pct: f64, sh: &Shared) {
+    p.bad = if p.loss_pct > 0.5 { p.bad + 1 } else { 0 };
+    p.good = if raw_pct < 0.3 { p.good + 1 } else { 0 };
+    if p.lane == Lane::Lossless && p.bad >= 3 {
+        p.lane = Lane::Compact;
+        p.last_report = None;
+        sh.event(format!("{}: link is dropping {:.1}% of audio — switched it to Opus with extra protection", p.name, p.loss_pct));
+    } else if p.lane == Lane::Compact && p.good >= 30 {
+        p.lane = Lane::Lossless;
+        p.last_report = None;
+        p.good = 0;
+        sh.event(format!("{}: link is clean again — back to lossless", p.name));
     }
-    Ok(())
 }
 
 fn to_mono(input: &[f32], ch: usize, out: &mut Vec<f32>) {
@@ -518,37 +614,66 @@ fn downmix(input: &[f32], ch: usize, out: &mut Vec<f32>) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn publish(sh: &Shared, router: &Router, enc: &Encoder, rate: u32, cap: &Capture, fs: usize, loss: f64, r: Option<&Report>, redundancy: usize, last_capture: Instant) {
+fn publish(sh: &Shared, peers: &HashMap<u64, Peer>, codec_of: impl Fn(Lane) -> Codec, rate: u32, cap: &Capture, fs: usize, last_capture: Instant, voice: bool) {
     let flowing = last_capture.elapsed() < Duration::from_millis(500);
-    let Some(cur) = router.current else {
-        sh.update(|s| {
-            s.phase = Phase::Searching;
-            s.capturing = flowing;
+    let sender_ms = (cap.chunk.load(Relaxed) as f64 / cap.rate as f64 + fs as f64 / rate as f64 + if voice { crate::voice::DELAY_SECS } else { 0.0 }) * 1000.0;
+    let mut list: Vec<PeerStatus> = peers
+        .values()
+        .filter(|p| p.current.is_some())
+        .map(|p| {
+            let cur = p.current.unwrap();
+            let route = net::route_name(cur.ip());
+            let (buffer, device) = p.last_report.map_or((0.0, 0.0), |r| (r.fill_us as f64 / 1000.0, r.device_us as f64 / 1000.0));
+            PeerStatus {
+                name: p.name.clone(),
+                addr: cur.ip().to_string(),
+                link: LinkKind::classify(&route, cur.ip()),
+                link_name: route,
+                codec: codec_of(p.lane).name().into(),
+                lossless: codec_of(p.lane) != Codec::Opus,
+                rtt_ms: p.rtt() as f32,
+                loss_pct: p.loss_pct as f32,
+                latency_ms: p.last_report.map_or(0.0, |r| (sender_ms + p.rtt() / 2.0 + buffer.max(r.target_us as f64 / 1000.0) + device) as f32),
+                sync_ms: p.sync_us as f32 / 1000.0,
+                playing: flowing && p.last_report.is_some() && p.live(),
+            }
+        })
+        .collect();
+    list.sort_by(|a, b| a.name.cmp(&b.name));
+    // The headline numbers follow the fastest device that's playing.
+    let primary = peers
+        .values()
+        .filter(|p| p.current.is_some())
+        .min_by(|a, b| {
+            let key = |p: &Peer| (p.last_report.is_none(), p.rtt());
+            key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal)
         });
-        return;
-    };
-    let rtt = router.paths.get(&cur).and_then(Path::score).unwrap_or(0.0) as f32;
-    let capture_ms = cap.chunk.load(Relaxed) as f32 * 1000.0 / cap.rate as f32;
-    let frame_ms = fs as f32 * 1000.0 / rate as f32;
-    let route = net::route_name(cur.ip());
     sh.update(|s| {
         s.capturing = flowing;
-        s.phase = if flowing && r.is_some() { Phase::Streaming } else { Phase::Idle };
-        s.peer_name = router.receiver.as_ref().map(|r| r.1.clone()).unwrap_or_else(|| cur.ip().to_string());
+        s.peers = list;
+        let Some(p) = primary else {
+            s.phase = Phase::Searching;
+            return;
+        };
+        let cur = p.current.unwrap();
+        let route = net::route_name(cur.ip());
+        s.phase = if flowing && p.last_report.is_some() { Phase::Streaming } else { Phase::Idle };
+        let n = peers.values().filter(|p| p.current.is_some()).count();
+        s.peer_name = if n > 1 { format!("{n} devices") } else { p.name.clone() };
         s.peer_addr = cur.ip().to_string();
         s.link = LinkKind::classify(&route, cur.ip());
-        s.link_name = route.clone();
-        s.codec = enc.codec().name().into();
+        s.link_name = route;
+        s.codec = codec_of(p.lane).name().into();
         s.sample_rate = rate;
-        s.lossless = enc.codec() != Codec::Opus;
-        s.rtt_ms = rtt;
-        s.loss_pct = loss as f32;
-        s.fec = redundancy;
-        if let Some(r) = r {
+        s.lossless = codec_of(p.lane) != Codec::Opus;
+        s.rtt_ms = p.rtt() as f32;
+        s.loss_pct = p.loss_pct as f32;
+        if let Some(r) = p.last_report {
             s.buffer_ms = r.fill_us as f32 / 1000.0;
             s.target_ms = r.target_us as f32 / 1000.0;
             s.device_ms = r.device_us as f32 / 1000.0;
-            s.latency_ms = capture_ms + frame_ms + rtt / 2.0 + s.buffer_ms + s.device_ms;
+            // The buffer already holds any sync wait once it has settled at its new target.
+            s.latency_ms = (sender_ms + p.rtt() / 2.0) as f32 + s.buffer_ms.max(s.target_ms) + s.device_ms;
             s.fixed = r.recovered;
             s.lost = r.concealed;
             s.underruns = r.underruns;

@@ -123,6 +123,9 @@ pub struct Beacon {
     pub receiver_id: u64,
     pub audio_port: u16,
     pub name: String,
+    /// Plays the mic link (PC side) rather than the PC's sound. Sent as a byte after the name;
+    /// older receivers didn't send it, so it falls back to "is it on MIC_PORT".
+    pub mic: bool,
 }
 
 pub fn write_beacon(b: &Beacon) -> Vec<u8> {
@@ -133,6 +136,7 @@ pub fn write_beacon(b: &Beacon) -> Vec<u8> {
     v.extend_from_slice(&b.audio_port.to_le_bytes());
     v.push(name.len() as u8);
     v.extend_from_slice(name);
+    v.push(b.mic as u8);
     v
 }
 
@@ -142,10 +146,12 @@ pub fn parse_beacon(buf: &[u8]) -> Option<Beacon> {
     }
     let len = buf[14] as usize;
     let name = buf.get(15..15 + len)?;
+    let audio_port = u16::from_le_bytes([buf[12], buf[13]]);
     Some(Beacon {
         receiver_id: u64::from_le_bytes(buf[4..12].try_into().ok()?),
-        audio_port: u16::from_le_bytes([buf[12], buf[13]]),
+        audio_port,
         name: String::from_utf8_lossy(name).into_owned(),
+        mic: buf.get(15 + len).map_or(audio_port == MIC_PORT, |&r| r == 1),
     })
 }
 
@@ -175,14 +181,16 @@ pub struct Report {
     pub target_us: u32,
     pub fill_us: u32,
     pub device_us: u32,
+    /// Buffer target without the sync delay the sender asked for (added in 0.8; 0 if absent).
+    pub base_target_us: u32,
 }
 
-pub fn write_report(r: &Report) -> [u8; 36] {
-    let mut v = [0u8; 36];
+pub fn write_report(r: &Report) -> [u8; 40] {
+    let mut v = [0u8; 40];
     v[0..4].copy_from_slice(MAGIC_REPORT);
     let fields = [
         r.stream_id, r.received, r.recovered, r.concealed, r.underruns, r.target_us, r.fill_us,
-        r.device_us,
+        r.device_us, r.base_target_us,
     ];
     for (i, f) in fields.iter().enumerate() {
         v[4 + i * 4..8 + i * 4].copy_from_slice(&f.to_le_bytes());
@@ -191,7 +199,7 @@ pub fn write_report(r: &Report) -> [u8; 36] {
 }
 
 pub fn parse_report(buf: &[u8]) -> Option<Report> {
-    if buf.len() != 36 || &buf[0..4] != MAGIC_REPORT {
+    if !(buf.len() == 36 || buf.len() == 40) || &buf[0..4] != MAGIC_REPORT {
         return None;
     }
     let f = |i: usize| u32_at(buf, 4 + i * 4);
@@ -204,6 +212,7 @@ pub fn parse_report(buf: &[u8]) -> Option<Report> {
         target_us: f(5),
         fill_us: f(6),
         device_us: f(7),
+        base_target_us: if buf.len() >= 40 { f(8) } else { f(5) },
     })
 }
 
@@ -217,6 +226,8 @@ pub struct Info {
     /// `engine::LinkKind` as seen from the sender, encoded by `link_to_u8`.
     pub link: u8,
     pub name: String,
+    /// Sync mode: extra delay this receiver should add so all devices play together (µs).
+    pub sync_delay_us: u32,
 }
 
 pub fn write_info(i: &Info) -> Vec<u8> {
@@ -229,6 +240,7 @@ pub fn write_info(i: &Info) -> Vec<u8> {
     v.push(i.link);
     v.push(name.len() as u8);
     v.extend_from_slice(name);
+    v.extend_from_slice(&i.sync_delay_us.to_le_bytes());
     v
 }
 
@@ -236,13 +248,15 @@ pub fn parse_info(buf: &[u8]) -> Option<Info> {
     if buf.len() < 18 || &buf[0..4] != MAGIC_INFO {
         return None;
     }
-    let name = buf.get(18..18 + buf[17] as usize)?;
+    let end = 18 + buf[17] as usize;
+    let name = buf.get(18..end)?;
     Some(Info {
         stream_id: u32_at(buf, 4),
         sender_us: u32_at(buf, 8),
         rtt_us: u32_at(buf, 12),
         link: buf[16],
         name: String::from_utf8_lossy(name).into_owned(),
+        sync_delay_us: if buf.len() >= end + 4 { u32_at(buf, end) } else { 0 },
     })
 }
 
@@ -293,19 +307,25 @@ mod tests {
 
     #[test]
     fn control_roundtrip() {
-        let b = parse_beacon(&write_beacon(&Beacon {
-            receiver_id: 42,
-            audio_port: 1234,
-            name: "Mac".into(),
-        }))
-        .unwrap();
-        assert_eq!((b.receiver_id, b.audio_port, b.name.as_str()), (42, 1234, "Mac"));
+        let b = parse_beacon(&write_beacon(&Beacon { receiver_id: 42, audio_port: 1234, name: "Mac".into(), mic: true })).unwrap();
+        assert_eq!((b.receiver_id, b.audio_port, b.name.as_str(), b.mic), (42, 1234, "Mac", true));
+        // An older receiver (no role byte) is classified by its port.
+        let mut old = write_beacon(&Beacon { receiver_id: 1, audio_port: MIC_PORT, name: "PC".into(), mic: false });
+        old.pop();
+        assert!(parse_beacon(&old).unwrap().mic);
         assert_eq!(parse_ping(MAGIC_PING, &write_ping(MAGIC_PING, 99)), Some(99));
         assert_eq!(parse_ping(MAGIC_PONG, &write_ping(MAGIC_PING, 99)), None);
         let r = Report { stream_id: 1, received: 2, concealed: 3, fill_us: 4, ..Default::default() };
         assert_eq!(parse_report(&write_report(&r)), Some(r));
-        let i = Info { stream_id: 5, sender_us: 11_000, rtt_us: 300, link: 2, name: "PC".into() };
-        assert_eq!(parse_info(&write_info(&i)), Some(i));
+        let i = Info { stream_id: 5, sender_us: 11_000, rtt_us: 300, link: 2, name: "PC".into(), sync_delay_us: 7_000 };
+        assert_eq!(parse_info(&write_info(&i)), Some(i.clone()));
+        // Older senders: no sync field.
+        let w = write_info(&i);
+        assert_eq!(parse_info(&w[..w.len() - 4]).unwrap().sync_delay_us, 0);
+        let r = Report { stream_id: 1, target_us: 9, base_target_us: 4, ..Default::default() };
+        assert_eq!(parse_report(&write_report(&r)), Some(r));
+        let old: Vec<u8> = write_report(&r)[..36].to_vec();
+        assert_eq!(parse_report(&old).unwrap().base_target_us, 9);
         assert_eq!(parse_alert(&write_alert(9, "Doorbell")), Some((9, "Doorbell".into())));
         assert_eq!(parse_alert(b"LGLE"), None);
     }

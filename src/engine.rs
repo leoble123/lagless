@@ -16,13 +16,14 @@ pub enum Phase {
     Error(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LinkKind {
     Cable,
     WiFi,
     Thunderbolt,
     Bluetooth,
     Loopback,
+    #[default]
     Network,
 }
 
@@ -70,6 +71,23 @@ impl LinkKind {
     }
 }
 
+/// One device the sender is streaming to.
+#[derive(Clone, Debug, Default)]
+pub struct PeerStatus {
+    pub name: String,
+    pub addr: String,
+    pub link: LinkKind,
+    pub link_name: String,
+    pub codec: String,
+    pub lossless: bool,
+    pub rtt_ms: f32,
+    pub loss_pct: f32,
+    pub latency_ms: f32,
+    /// Extra delay it's adding to stay in sync with the slowest device.
+    pub sync_ms: f32,
+    pub playing: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Status {
     pub phase: Phase,
@@ -96,6 +114,8 @@ pub struct Status {
     pub engine_ms: f32,
     /// Sender: audio is coming in from the capture device.
     pub capturing: bool,
+    /// Sender: every device being streamed to.
+    pub peers: Vec<PeerStatus>,
     /// Receiver: worst gap between packets over the last few seconds (what the buffer must cover).
     pub jitter_ms: f32,
     pub engine_default_ms: f32,
@@ -126,6 +146,7 @@ impl Default for Status {
             engine_ms: 0.0,
             jitter_ms: 0.0,
             capturing: false,
+            peers: Vec::new(),
             engine_default_ms: 0.0,
         }
     }
@@ -143,6 +164,10 @@ pub struct Shared {
     alerts_in: Mutex<Vec<String>>,
     /// Wakes the UI (set by the app), so an alert shows even while the window is in the background.
     waker: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Sender: device names not to stream to, and sync mode. Live from the UI, so changing them
+    /// never interrupts the other devices.
+    pub exclude: Mutex<Vec<String>>,
+    pub sync: AtomicBool,
     /// Output (receiver) or stream (sender) volume, live from the UI.
     pub volume: Arc<crate::playout::Volume>,
 }

@@ -29,6 +29,8 @@ pub struct Stats {
     /// Set once the network thread has seen enough packets to know how bursty arrivals are.
     /// Until then playback waits, instead of starting blind and underrunning once.
     pub warm: AtomicBool,
+    /// Sync mode: extra delay the sender asked for so every device plays together (µs).
+    pub sync_us: AtomicU32,
 }
 
 /// Linear gain shared with the UI thread, stored as f32 bits so the slider applies instantly.
@@ -201,7 +203,8 @@ impl Playout {
         // Must ride out one device callback, a frame or two, and the burstiest recent arrivals
         // (the fill level swings ±gap/2 around its average).
         let need = cb_frames as f64 * self.base_step + frame * 2.0 + gap * 0.6;
-        (self.user_min.max(need), gap)
+        let sync = self.stats.sync_us.load(Relaxed) as f64 * 1e-6 * self.src_rate;
+        (self.user_min.max(need) + sync, gap)
     }
 
     /// Fill `out` (interleaved, `out_ch` channels, device rate).

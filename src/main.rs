@@ -72,6 +72,9 @@ enum Cmd {
         /// Noise suppression + leveling for a microphone source (adds ~20 ms)
         #[arg(long)]
         voice_focus: bool,
+        /// Keep every receiver at the same delay (several speakers in one room)
+        #[arg(long)]
+        sync: bool,
         /// Sample rate for --source tone
         #[arg(long, default_value_t = 48000, hide = true)]
         tone_rate: u32,
@@ -151,10 +154,10 @@ fn run() -> Result<()> {
     let sh = engine::Shared::new();
     let worker = sh.clone();
     let job: Box<dyn FnOnce() -> Result<()> + Send> = match cmd {
-        Cmd::Send { to, port, name, codec, frame_ms, fec, bitrate, source, device, sim_loss, tone_rate, no_multipath, no_engine_boost, voice_focus } => {
+        Cmd::Send { to, port, name, codec, frame_ms, fec, bitrate, source, device, sim_loss, tone_rate, no_multipath, no_engine_boost, voice_focus, sync } => {
             let o = sender::Options {
                 to, port, name, codec, frame_ms, redundancy: fec.min(8), bitrate_kbps: bitrate, source, device, sim_loss, tone_rate,
-                multipath: !no_multipath, engine_boost: !no_engine_boost, voice_focus,
+                multipath: !no_multipath, engine_boost: !no_engine_boost, voice_focus, exclude: Vec::new(), sync,
             };
             Box::new(move || sender::run(o, worker))
         }

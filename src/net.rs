@@ -85,9 +85,9 @@ fn friendly_iface(dev: &str) -> String {
 }
 
 /// Receiver side: announce ourselves on every interface, once a second, while `alive` exists.
-pub fn spawn_beacon(receiver_id: u64, name: String, audio_port: u16, alive: Weak<()>) -> Result<()> {
+pub fn spawn_beacon(receiver_id: u64, name: String, audio_port: u16, mic: bool, alive: Weak<()>) -> Result<()> {
     let sock = udp_socket(0, true, false)?;
-    let pkt = protocol::write_beacon(&Beacon { receiver_id, audio_port, name });
+    let pkt = protocol::write_beacon(&Beacon { receiver_id, audio_port, name, mic });
     std::thread::Builder::new().name("beacon".into()).spawn(move || while alive.upgrade().is_some() {
         for t in broadcast_targets() {
             let _ = sock.send_to(&pkt, (t, DISCOVERY_PORT));
@@ -109,7 +109,8 @@ fn broadcast_targets() -> Vec<Ipv4Addr> {
 
 pub struct Seen {
     pub name: String,
-    pub first_seen: Instant,
+    /// Mic-link receiver (on the PC) rather than a speaker.
+    pub mic: bool,
     pub addrs: HashMap<SocketAddr, Instant>,
 }
 
@@ -144,7 +145,7 @@ pub fn spawn_listener() -> Result<Directory> {
             let mut d = d.lock().unwrap();
             let e = d.entry(b.receiver_id).or_insert_with(|| Seen {
                 name: b.name.clone(),
-                first_seen: Instant::now(),
+                mic: b.mic,
                 addrs: HashMap::new(),
             });
             e.addrs.insert(addr, Instant::now());

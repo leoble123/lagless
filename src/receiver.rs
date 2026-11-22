@@ -70,8 +70,9 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
     let name = o.name.clone().unwrap_or_else(net::hostname);
     let alive = Arc::new(());
     let my_id = net::random_u64();
-    net::spawn_beacon(my_id, name.clone(), o.port, Arc::downgrade(&alive))?;
-    let my_beacon = protocol::write_beacon(&protocol::Beacon { receiver_id: my_id, audio_port: o.port, name: name.clone() });
+    let mic = o.port == protocol::MIC_PORT;
+    net::spawn_beacon(my_id, name.clone(), o.port, mic, Arc::downgrade(&alive))?;
+    let my_beacon = protocol::write_beacon(&protocol::Beacon { receiver_id: my_id, audio_port: o.port, name: name.clone(), mic });
     sh.update(|s| {
         s.phase = Phase::Searching;
         s.peer_name.clear();
@@ -92,12 +93,18 @@ pub fn run(o: Options, sh: Arc<Shared>) -> Result<()> {
                     let _ = sock.send_to(&protocol::write_ping(protocol::MAGIC_PONG, t), src);
                 } else if let Some(info) = protocol::parse_info(pkt) {
                     if let Some(s) = session.as_mut().filter(|s| s.header.stream_id == info.stream_id) {
+                        s.stats.sync_us.store(info.sync_delay_us.min(500_000), Relaxed);
                         s.info = Some(info);
                     }
                 } else if let Some((h, frames)) = protocol::parse_audio(pkt) {
-                    // The codec may change mid-stream (auto mode); anything else means a new stream.
-                    let key = |h: &AudioHeader| (h.stream_id, h.sample_rate, h.channels);
-                    if session.as_ref().map(|s| key(&s.header)) != Some(key(&h)) {
+                    // The codec may change mid-stream (auto mode). A new stream id from the same PC
+                    // in the same format (it moved this device to another quality lane) just
+                    // restarts the sequence; anything else reopens the output.
+                    let same_output = |s: &Session| s.header.sample_rate == h.sample_rate && s.header.channels == h.channels && s.sender.ip() == src.ip();
+                    if let Some(s) = session.as_mut().filter(|s| s.header.stream_id != h.stream_id && same_output(s)) {
+                        s.restart_stream(h);
+                    }
+                    if session.as_ref().map(|s| (s.header.stream_id, s.header.sample_rate, s.header.channels)) != Some((h.stream_id, h.sample_rate, h.channels)) {
                         session = None; // drop the old output stream before opening a new one
                         match open_session(&o, h, src, &sh) {
                             Ok(s) => session = Some(s),
@@ -281,6 +288,21 @@ impl Session {
         }
     }
 
+    /// Same output, new stream: forget sequence/decoder state, keep the device and buffer.
+    fn restart_stream(&mut self, h: AudioHeader) {
+        self.header = h;
+        self.decoder = None;
+        self.pending.clear();
+        self.expected = None;
+        self.newest_primary = None;
+        self.fec_depth = 0;
+        self.conceal_run = 0;
+        self.received = 0;
+        self.recovered = 0;
+        self.concealed = 0;
+        self.info = None;
+    }
+
     fn note_arrival(&mut self) {
         // ~300 ms of arrivals is enough to see the sender's burst pattern (one-off per stream).
         if self.created.elapsed() > Duration::from_millis(300) {
@@ -419,6 +441,7 @@ impl Session {
             concealed: self.concealed,
             underruns: self.stats.underruns.load(Relaxed),
             target_us: self.stats.target_us.load(Relaxed),
+            base_target_us: self.stats.target_us.load(Relaxed).saturating_sub(self.stats.sync_us.load(Relaxed)),
             fill_us: self.stats.fill_us.load(Relaxed),
             device_us: self.stats.device_us.load(Relaxed),
         }

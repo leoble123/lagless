@@ -75,6 +75,10 @@ pub struct Settings {
     /// (0) so files written before it existed get migrated.
     #[serde(default)]
     pub tuning: u32,
+    /// PC: receivers (by name) not to stream to. Everything else found gets the audio.
+    pub excluded_devices: Vec<String>,
+    /// PC: make every device play at the same delay (speakers in one room).
+    pub sync_devices: bool,
     /// Mac mic: noise suppression + voice leveling before sending.
     pub voice_focus: bool,
     /// Sound awareness (Mac): listen to the room and flag important sounds.
@@ -114,6 +118,8 @@ impl Default for Settings {
             multipath: true,
             engine_boost: true,
             tuning: 1,
+            excluded_devices: Vec::new(),
+            sync_devices: false,
             voice_focus: true,
             aware: false,
             aware_categories: crate::aware::Category::ALL.iter().copied().filter(|c| c.on_by_default()).collect(),
@@ -233,6 +239,8 @@ impl Engine {
                         multipath: s.multipath,
                         engine_boost: s.engine_boost,
                         voice_focus: false,
+                        exclude: s.excluded_devices.clone(),
+                        sync: s.sync_devices,
                     },
                     sh,
                 )
@@ -263,6 +271,8 @@ impl Engine {
                         multipath: s.multipath,
                         engine_boost: false,
                         voice_focus: s.voice_focus,
+                        exclude: Vec::new(),
+                        sync: false,
                     },
                     sh,
                 )
@@ -592,6 +602,8 @@ impl eframe::App for App {
                     if self.settings.mode == Mode::Receive {
                         ui.add_space(8.0);
                         self.aware_row(ui, &ctx);
+                    } else {
+                        self.devices_list(ui);
                     }
                     ui.add_space(10.0);
                     egui::ScrollArea::vertical().max_height(ui.available_height() - 36.0).show(ui, |ui| self.details(ui));
@@ -790,6 +802,71 @@ impl App {
             self.draft.mic_send = self.settings.mic_send;
             self.draft.mic_receive = self.settings.mic_receive;
             self.restart_mic(ctx);
+        }
+    }
+
+    /// Sender with more than one device: who's getting the audio, live include/exclude, sync.
+    fn devices_list(&mut self, ui: &mut Ui) {
+        let peers = self.status.peers.clone();
+        if peers.len() < 2 && self.settings.excluded_devices.is_empty() {
+            return;
+        }
+        ui.add_space(10.0);
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("DEVICES · {}", peers.len())).size(10.5).color(DIM).strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if toggle(ui, &mut self.settings.sync_devices).on_hover_text("Every device waits for the slowest one, so speakers in the same room don't echo. Adds delay to the faster devices.").clicked() {
+                    changed = true;
+                }
+                ui.label(RichText::new("In sync").size(12.0).color(TEXT));
+            });
+        });
+        let row = |ui: &mut Ui, on: &mut bool, name: &str, detail: String, col: Color32, tip: String| -> bool {
+            let mut flip = false;
+            ui.horizontal(|ui| {
+                flip = ui.checkbox(on, RichText::new(name).size(12.5).color(TEXT)).changed();
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let l = ui.label(RichText::new(detail).size(11.5).color(col));
+                    if !tip.is_empty() {
+                        l.on_hover_text(tip);
+                    }
+                });
+            });
+            flip
+        };
+        for p in &peers {
+            let mut on = true;
+            let lat = if p.latency_ms > 0.0 { format!("{:.0} ms", p.latency_ms) } else { "…".into() };
+            let q = if p.lossless { "" } else { " · Opus" };
+            let col = if p.playing { DIM } else { OK };
+            let tip = format!(
+                "{} via {}\n{} · round trip {:.2} ms · {:.1}% lost{}",
+                p.addr,
+                p.link_name,
+                p.codec,
+                p.rtt_ms,
+                p.loss_pct,
+                if p.sync_ms > 0.5 { format!("\nwaiting +{:.0} ms to stay in sync", p.sync_ms) } else { String::new() }
+            );
+            if row(ui, &mut on, &p.name, format!("{}{q} · {lat}", p.link.label()), col, tip) && !on {
+                self.settings.excluded_devices.push(p.name.clone());
+                changed = true;
+            }
+        }
+        for name in self.settings.excluded_devices.clone() {
+            let mut on = false;
+            if row(ui, &mut on, &name, "not streaming".into(), DIM, String::new()) && on {
+                self.settings.excluded_devices.retain(|n| n != &name);
+                changed = true;
+            }
+        }
+        if changed {
+            *self.engine.shared.exclude.lock().unwrap() = self.settings.excluded_devices.clone();
+            self.engine.shared.sync.store(self.settings.sync_devices, std::sync::atomic::Ordering::Relaxed);
+            self.draft.excluded_devices = self.settings.excluded_devices.clone();
+            self.draft.sync_devices = self.settings.sync_devices;
+            self.settings.save();
         }
     }
 
