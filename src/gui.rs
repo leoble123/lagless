@@ -361,6 +361,7 @@ fn default_output_name() -> Option<String> {
 }
 
 const VB_CABLE_URL: &str = "https://vb-audio.com/Cable/";
+const RELEASES_URL: &str = "https://github.com/leoble123/lagless/releases/latest";
 
 struct Devices {
     outputs: Vec<String>,
@@ -749,6 +750,11 @@ impl App {
                     }
                     update::State::Downloading(v) => {
                         ui.label(RichText::new(format!("Getting {v}…")).font(reg(12.0)).color(DIM));
+                    }
+                    update::State::Failed(e) => {
+                        if pill(ui, "Update failed", BAD.gamma_multiply(0.35), TEXT).on_hover_text(format!("{e}\n\nClick to download it manually")).clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(RELEASES_URL));
+                        }
                     }
                     _ => {}
                 }
@@ -1295,15 +1301,25 @@ impl App {
         App::perf_settings(d, ui);
         group(ui, "Updates", "", |ui| {
             row(ui, Some((Glyph::Download, GRAY)), "Update automatically", TEXT, None, Trail::Switch(&mut d.auto_update));
-            let state = match self.updater.state() {
+            let st = self.updater.state();
+            let state = match &st {
                 update::State::Checking => "Checking…".to_string(),
                 update::State::Downloading(v) => format!("Getting {v}…"),
-                update::State::Ready(v) => format!("{v} ready"),
+                update::State::Ready(v) => format!("{v} ready · restart"),
                 update::State::Available(v) => format!("{v} available"),
+                update::State::Failed(_) => "Couldn't update".to_string(),
                 _ => format!("You have {}", update::VERSION),
             };
-            if row(ui, None, "Check now", ACCENT, None, Trail::Value(state, DIM)).clicked() {
+            let failed = match &st {
+                update::State::Failed(e) => Some(e.clone()),
+                _ => None,
+            };
+            let col = if failed.is_some() { BAD } else { DIM };
+            if row(ui, None, "Check now", ACCENT, failed.as_deref().map(|e| (e, BAD)), Trail::Value(state, col)).clicked() {
                 self.updater.check_now();
+            }
+            if failed.is_some() && row(ui, None, "Download it manually", ACCENT, None, Trail::Chevron(String::new())).clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(RELEASES_URL));
             }
         });
     }

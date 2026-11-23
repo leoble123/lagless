@@ -161,6 +161,15 @@ impl Updater {
             return Ok(Some(version));
         }
         let sum_url = url_of(&format!("{ASSET}.sha256")).ok_or_else(|| anyhow!("release {tag} has no checksum"))?;
+        // macOS runs apps opened from a disk image or straight from Downloads from a read-only
+        // copy; the update could never be put in place, so say so before downloading.
+        #[cfg(target_os = "macos")]
+        if let Some(app) = bundle_path() {
+            let p = app.to_string_lossy();
+            if p.contains("/AppTranslocation/") || p.starts_with("/Volumes/") {
+                bail!("lagless is running from the disk image or Downloads. Drag it into Applications, open it from there, and it can update itself");
+            }
+        }
 
         self.set(State::Downloading(version.clone()));
         let want = String::from_utf8(download(&sum_url)?)?.split_whitespace().next().unwrap_or("").to_lowercase();
@@ -190,7 +199,14 @@ fn agent() -> ureq::Agent {
 }
 
 fn download(url: &str) -> Result<Vec<u8>> {
-    Ok(agent().get(url).call()?.body_mut().with_config().limit(200 << 20).read_to_vec()?)
+    // The app is ~16 MB: allow slow connections plenty of time (the API calls keep 2 minutes).
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(15 * 60)))
+        .timeout_connect(Some(Duration::from_secs(20)))
+        .user_agent(format!("lagless/{VERSION}"))
+        .build()
+        .into();
+    Ok(agent.get(url).call()?.body_mut().with_config().limit(200 << 20).read_to_vec()?)
 }
 
 fn parse_version(v: &str) -> Vec<u64> {

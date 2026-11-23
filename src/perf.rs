@@ -449,7 +449,8 @@ mod frame_source {
                 Some(Source(t))
             }
             Err(e) => {
-                let denied = matches!(&e, ferrisetw::trace::TraceError::EtwNativeError(ferrisetw::native::EvntraceNativeError::IoError(io)) if io.raw_os_error() == Some(5));
+                // Access denied arrives as plain 5 or as the HRESULT 0x80070005, depending on the call.
+                let denied = matches!(&e, ferrisetw::trace::TraceError::EtwNativeError(ferrisetw::native::EvntraceNativeError::IoError(io)) if io.raw_os_error().is_some_and(|c| c == 5 || c as u32 == 0x8007_0005));
                 frames.lock().unwrap().problem = if denied { super::NEEDS_PERMISSION.into() } else { format!("FPS counter failed: {e:?}") };
                 None
             }
