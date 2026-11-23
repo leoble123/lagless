@@ -109,8 +109,10 @@ PresentMon uses) and GPU numbers from NVIDIA's driver, so there's nothing for an
 Windows only lets admins read frame timing; the first time, lagless shows **Allow the FPS
 counter** (one admin prompt, then sign out of Windows and back in once).
 
-Turn it on or off, and pick the on-screen display and its corner, in Settings → Game stats on the
-PC; on the Mac, Settings → PC performance. The on-screen display shows over games in windowed
+Turn it on or off in Settings → Game stats on the PC (on the Mac, Settings → PC performance).
+**FPS readout** sets how calm the number is: Responsive, Balanced (default) or Smooth.
+Settings → On-screen display picks the style (full, one compact line, or just the FPS), size,
+corner, background and text opacity, and whether the FPS is color-coded, with a live preview. The on-screen display shows over games in windowed
 fullscreen (borderless), not exclusive fullscreen.
 
 ## Sound alerts (hear the room with your IEMs in)

@@ -109,6 +109,15 @@ pub struct Settings {
     pub perf_osd_corner: u8,
     /// Mac: show the PC's game stats.
     pub perf_show: bool,
+    /// How calm the FPS number is: 0 responsive, 1 balanced, 2 smooth.
+    pub perf_smoothing: u8,
+    /// On-screen display look: style (0 full, 1 compact, 2 FPS only), size (0-2), background
+    /// and text opacity, color-coded FPS.
+    pub perf_osd_style: u8,
+    pub perf_osd_size: u8,
+    pub perf_osd_bg: f32,
+    pub perf_osd_text: f32,
+    pub perf_osd_color: bool,
     /// Volume slider position, 0..1 (see `Volume::slider_to_gain`).
     pub volume: f32,
     pub auto_update: bool,
@@ -149,6 +158,12 @@ impl Default for Settings {
             perf_osd: false,
             perf_osd_corner: 0,
             perf_show: true,
+            perf_smoothing: 1,
+            perf_osd_style: 0,
+            perf_osd_size: 1,
+            perf_osd_bg: 0.8,
+            perf_osd_text: 1.0,
+            perf_osd_color: true,
             volume: 1.0,
             auto_update: true,
         }
@@ -1150,10 +1165,16 @@ impl App {
             }
             if link("done", "Done", semi(16.0), false) {
                 let mode = self.settings.mode;
+                let before = self.settings.clone();
                 self.settings = self.draft.clone();
                 self.settings.mode = mode;
                 self.show_settings = false;
-                self.restart(ctx);
+                // Display-only changes (stats look, smoothing) apply live; don't interrupt audio.
+                if needs_restart(&before, &self.settings) {
+                    self.restart(ctx);
+                } else {
+                    self.settings.save();
+                }
             }
         });
         egui::ScrollArea::vertical().id_salt("settings-scroll").auto_shrink([false, false]).show(ui, |ui| {
@@ -1298,7 +1319,7 @@ impl App {
                 }
             }
         }
-        App::perf_settings(d, ui);
+        App::perf_settings(d, ui, &self.perf_view);
         group(ui, "Updates", "", |ui| {
             row(ui, Some((Glyph::Download, GRAY)), "Update automatically", TEXT, None, Trail::Switch(&mut d.auto_update));
             let st = self.updater.state();
@@ -1439,6 +1460,25 @@ fn group<R>(ui: &mut Ui, header: &str, footer: &str, add: impl FnOnce(&mut Ui) -
     }
     ui.add_space(24.0);
     r
+}
+
+/// Whether going from `a` to `b` touches anything the engines use (vs. display-only choices).
+fn needs_restart(a: &Settings, b: &Settings) -> bool {
+    let display_only = |s: &Settings| {
+        let mut s = s.clone();
+        s.perf_osd = false;
+        s.perf_osd_corner = 0;
+        s.perf_osd_style = 0;
+        s.perf_osd_size = 0;
+        s.perf_osd_bg = 0.0;
+        s.perf_osd_text = 0.0;
+        s.perf_osd_color = false;
+        s.perf_smoothing = 0;
+        s.perf_show = false;
+        s.volume = 0.0;
+        serde_json::to_string(&s).unwrap_or_default()
+    };
+    display_only(a) != display_only(b)
 }
 
 fn is_first(ui: &Ui) -> bool {
@@ -2093,7 +2133,20 @@ pub fn run() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Settings;
+    use super::{needs_restart, Settings};
+
+    #[test]
+    fn display_only_changes_dont_restart_audio() {
+        let a = Settings::default();
+        let mut b = a.clone();
+        b.perf_osd_style = 2;
+        b.perf_osd_bg = 0.3;
+        b.perf_smoothing = 2;
+        b.volume = 0.2;
+        assert!(!needs_restart(&a, &b));
+        b.min_latency = 9.0;
+        assert!(needs_restart(&a, &b));
+    }
 
     #[test]
     fn migrates_old_buffer_default_only() {
